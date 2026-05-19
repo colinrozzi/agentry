@@ -115,9 +115,6 @@ pub fn search_path() -> Vec<PathBuf> {
         return env.split(':').map(PathBuf::from).collect();
     }
     let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(&home).join("work/manager/recipes"));
-    }
     if let Some(dirs) = directories::BaseDirs::new() {
         roots.push(dirs.config_dir().join("agentry/recipes"));
     }

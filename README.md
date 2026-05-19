@@ -1,18 +1,21 @@
 # agentry
 
-A small CLI tool for managing local AI agent sessions: recipes, worktrees, and tmux-backed lifecycle.
+A small CLI tool for managing local AI agent sessions: recipes, jj workspaces, and tmux-backed lifecycle.
 
 Designed for the one-human, one-machine case — you sit at your laptop, want to spin up agents on demand for specific tasks or as long-lived specialists, see what's running, and tear them down cleanly. No service, no central coordinator; just a tool.
 
-## Status: v0 (recipe parsing)
+## Commands
 
-What works:
-- `agentry recipes list` — enumerate recipes found in the search path
-- `agentry recipes show <name|path>` — display one recipe's metadata + paths
+```sh
+agentry recipes list                 # enumerate recipes in the search path
+agentry recipes show <name|path>     # show one recipe's metadata + paths
 
-What's stubbed (next):
-- `agentry start <recipe>` — would create a worktree + drop the CLAUDE.md + start a tmux session running `claude`. Currently prints what it would do.
-- `agentry list` / `stop` / `show` / `attach` — session lifecycle, not yet implemented.
+agentry start <recipe> [--repo <p>] [--for <ticket>]
+agentry list                         # what's running (queries tmux for liveness)
+agentry show <name>                  # full state for one session
+agentry attach <name>                # tmux attach -t agent-<name>
+agentry stop <name>                  # kill tmux, forget workspace, delete state
+```
 
 ## The model
 
@@ -29,7 +32,7 @@ claude_md_path = "./CLAUDE.md"
 
 Two shapes naturally emerge:
 - **Bound recipes** (`inbox-dev`, `theater-dev`, etc): repository fixed in the recipe. Long-lived specialists.
-- **Generic recipes** (`coding`, `review`, `investigator`): no fixed repository; specify at spawn time. Short-lived task workers.
+- **Generic recipes** (`coding`, `review`, `investigator`): no fixed repository; specify at spawn time with `--repo`. Short-lived task workers.
 
 The directory containing `recipe.toml` is purely organizational; the tool only cares about the file and the paths it references.
 
@@ -37,27 +40,30 @@ The directory containing `recipe.toml` is purely organizational; the tool only c
 
 `agentry start <name>` and `agentry recipes list` look in (in order):
 1. The `AGENTRY_RECIPES` env var (colon-separated, like `$PATH`), if set
-2. `~/work/manager/recipes/`
-3. `$XDG_CONFIG_HOME/agentry/recipes/` (typically `~/.config/agentry/recipes/`)
+2. `$XDG_CONFIG_HOME/agentry/recipes/` (typically `~/.config/agentry/recipes/`)
 
 You can also bypass the search path: `agentry start /tmp/my-recipe.toml`.
 
-### Session lifecycle (planned)
+### Session lifecycle
 
 When you `agentry start <recipe>`:
-1. Create a worktree at `~/work/agentry-sessions/<uuid>/` from the recipe's repository, based on `main`
-2. Copy the recipe's `CLAUDE.md` into the worktree root
-3. Start a detached tmux session named `agent-<uuid>` running `claude` in the worktree
-4. Write a state file at `~/.local/state/agentry/<uuid>.json` with the session's metadata
+1. Create a jj workspace at `~/work/agentry-sessions/<uuid>/` based on `main` of the recipe's repository (named `agent-<short>` in `jj workspace list`)
+2. Copy the recipe's `CLAUDE.md` into the workspace root
+3. Start a detached tmux session named `agent-<short>` running `claude` in the workspace
+4. Write a state file at `~/.local/state/agentry/<short>.json` with the session's metadata
 
-`agentry list` reads state files + queries tmux to show what's running. `agentry attach <name>` is a shortcut for `tmux attach -t agent-<name>`. `agentry stop <name>` kills the tmux session, removes the worktree, and deletes the state file.
+`agentry list` reads state files + queries tmux to show what's running. `agentry attach <name>` is a shortcut for `tmux attach -t agent-<name>`. `agentry stop <name>` kills the tmux session, forgets the jj workspace, deletes the worktree directory, and removes the state file.
 
-## Build
+The repo must be jj-colocated. We use `jj workspace add` rather than `git worktree add` so that multiple sessions can coexist on top of `main` without git's "one worktree per branch" restriction.
+
+## Build & install
 
 ```sh
-nix develop --command cargo build
-# or just
-cargo build
+nix develop --command cargo build       # debug build at ./target/debug/agentry
+nix build                               # release build via flake
+
+nix profile install /home/colin/work/agentry   # install into user profile
+nix profile upgrade agentry                    # pick up local changes
 ```
 
 ## Why not a service?
