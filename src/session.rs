@@ -40,8 +40,7 @@ impl Session {
     pub fn delete(&self) -> Result<()> {
         let path = state_dir()?.join(format!("{}.json", self.name));
         if path.exists() {
-            fs::remove_file(&path)
-                .with_context(|| format!("removing state {}", path.display()))?;
+            fs::remove_file(&path).with_context(|| format!("removing state {}", path.display()))?;
         }
         Ok(())
     }
@@ -50,9 +49,7 @@ impl Session {
 pub fn state_dir() -> Result<PathBuf> {
     let dirs = directories::BaseDirs::new()
         .ok_or_else(|| anyhow::anyhow!("could not determine base dirs"))?;
-    Ok(dirs.state_dir()
-        .unwrap_or(dirs.data_dir())
-        .join("agentry"))
+    Ok(dirs.state_dir().unwrap_or(dirs.data_dir()).join("agentry"))
 }
 
 pub fn list_all() -> Result<Vec<Session>> {
@@ -88,7 +85,10 @@ pub fn find(name_or_uuid: &str) -> Result<Session> {
 
 /// Generate a short identifier from a UUID (first 8 hex chars).
 pub fn short_name(uuid: &str) -> String {
-    uuid.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect()
+    uuid.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect()
 }
 
 /// Now as an RFC3339 string.
@@ -101,7 +101,6 @@ pub fn now_rfc3339() -> Result<String> {
 /// Convenience for callers wanting to derive paths from a path arg or name.
 #[allow(dead_code)]
 pub fn worktree_root() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     Ok(Path::new(&home).join("work/agentry-sessions"))
 }

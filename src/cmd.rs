@@ -86,7 +86,10 @@ pub fn start(reference: &str, repo_override: Option<&str>, ticket: Option<&str>)
             .arg(&workspace_name)
             .status();
         let _ = std::fs::remove_dir_all(&worktree);
-        return Err(anyhow!("tmux new-session failed (exit {:?})", status.code()));
+        return Err(anyhow!(
+            "tmux new-session failed (exit {:?})",
+            status.code()
+        ));
     }
 
     let session = Session {
@@ -102,7 +105,12 @@ pub fn start(reference: &str, repo_override: Option<&str>, ticket: Option<&str>)
     };
     session.save()?;
 
-    println!("spawned {} (recipe={}, repo={})", short, recipe.name, repo.display());
+    println!(
+        "spawned {} (recipe={}, repo={})",
+        short,
+        recipe.name,
+        repo.display()
+    );
     println!("  worktree: {}", worktree.display());
     println!("  tmux:     {}", tmux_session);
     if let Some(t) = ticket {
@@ -123,8 +131,18 @@ pub fn list() -> Result<()> {
     }
     let live: std::collections::HashSet<String> = tmux_alive_sessions()?.into_iter().collect();
 
-    let name_w = sessions.iter().map(|s| s.name.len()).max().unwrap_or(4).max(4);
-    let recipe_w = sessions.iter().map(|s| s.recipe_name.len()).max().unwrap_or(6).max(6);
+    let name_w = sessions
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let recipe_w = sessions
+        .iter()
+        .map(|s| s.recipe_name.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
     println!(
         "{:<nw$}  {:<rw$}  status      ticket  started_at",
         "name",
@@ -235,7 +253,12 @@ pub fn recipes_list() -> Result<()> {
         }
         return Ok(());
     }
-    let name_w = recipes.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
+    let name_w = recipes
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
     println!("{:<width$}  description", "name", width = name_w);
     println!("{:<width$}  -----------", "----", width = name_w);
     for r in recipes {

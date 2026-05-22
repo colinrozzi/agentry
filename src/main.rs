@@ -76,9 +76,11 @@ fn main() -> Result<()> {
             RecipesCmd::List => cmd::recipes_list(),
             RecipesCmd::Show { recipe } => cmd::recipes_show(&recipe),
         },
-        Cmd::Start { recipe, repo, r#for } => {
-            cmd::start(&recipe, repo.as_deref(), r#for.as_deref())
-        }
+        Cmd::Start {
+            recipe,
+            repo,
+            r#for,
+        } => cmd::start(&recipe, repo.as_deref(), r#for.as_deref()),
         Cmd::List => cmd::list(),
         Cmd::Stop { name } => cmd::stop(&name),
         Cmd::Show { name } => cmd::show(&name),

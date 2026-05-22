@@ -1,18 +1,20 @@
 //! agentry-actor — orchestrates local agent containers via the podman handler.
 //!
-//! Phase 2: HTTP routing + first podman.run integration.
-//!
-//!   POST /sessions  → start a hardcoded test container (proves the binding)
-//!   GET  /          → liveness probe
+//! HTTP API on 127.0.0.1:8090:
+//!   GET    /                       — liveness probe (text/plain)
+//!   POST   /sessions               — start a container from a spec (JSON body)
+//!   GET    /sessions               — list all containers (JSON array)
+//!   GET    /sessions/<name>        — single container (JSON object, 404 if missing)
+//!   DELETE /sessions/<name>        — stop + remove (idempotent, 204 on success)
 
 #![no_std]
 extern crate alloc;
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::vec;
 use alloc::vec::Vec;
 use packr_guest::{export, import, pack_types, GraphValue, Value};
+use serde::Deserialize;
 
 packr_guest::setup_guest!();
 
@@ -36,7 +38,6 @@ pub struct ContainerSpec {
     pub name: String,
     pub env: Vec<(String, String)>,
     pub mounts: Vec<MountSpec>,
-    /// Empty = use the image's default command.
     pub cmd: Vec<String>,
     pub tty: bool,
     pub interactive: bool,
@@ -49,7 +50,6 @@ pub struct ContainerInfo {
     pub name: String,
     pub image: String,
     pub status: String,
-    /// -1 if the container is still running.
     #[graph(rename = "exit-code")]
     pub exit_code: i32,
 }
@@ -61,7 +61,35 @@ pub struct ActorState {
 }
 
 // ============================================================================
-// Pack types
+// JSON request body shape (deserialized from POST /sessions)
+// ============================================================================
+
+#[derive(Deserialize)]
+struct SessionRequest<'a> {
+    image: &'a str,
+    name: &'a str,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    #[serde(default)]
+    mounts: Vec<MountReq<'a>>,
+    #[serde(default)]
+    cmd: Vec<String>,
+    #[serde(default)]
+    tty: bool,
+    #[serde(default)]
+    interactive: bool,
+}
+
+#[derive(Deserialize)]
+struct MountReq<'a> {
+    source: &'a str,
+    target: &'a str,
+    #[serde(default, rename = "read_only")]
+    read_only: bool,
+}
+
+// ============================================================================
+// pack_types
 // ============================================================================
 
 pack_types!(file = "agentry-actor.types");
@@ -119,17 +147,14 @@ fn init(_state: Value) -> Result<(ActorState, ()), String> {
 }
 
 #[export(name = "theater:simple/tcp-client.handle-connection")]
-fn handle_connection(
-    state: ActorState,
-    connection_id: String,
-) -> Result<(ActorState, ()), String> {
+fn handle_connection(state: ActorState, connection_id: String) -> Result<(ActorState, ()), String> {
     if let Err(e) = tcp_activate(connection_id.clone()) {
         log(format!("[agentry-actor] activate failed: {}", e));
         return Ok((state, ()));
     }
 
-    let body = match tcp_receive(connection_id.clone(), 8192) {
-        Ok(bytes) => bytes,
+    let bytes = match tcp_receive(connection_id.clone(), 16384) {
+        Ok(b) => b,
         Err(e) => {
             log(format!("[agentry-actor] receive failed: {}", e));
             let _ = tcp_close(connection_id);
@@ -137,8 +162,8 @@ fn handle_connection(
         }
     };
 
-    let (status, body_text) = route(&body);
-    let response = format_response(status, &body_text);
+    let (status, body, content_type) = route(&bytes);
+    let response = format_response(status, &body, content_type);
     if let Err(e) = tcp_send(connection_id.clone(), response.into_bytes()) {
         log(format!("[agentry-actor] send failed: {}", e));
     }
@@ -150,86 +175,241 @@ fn handle_connection(
 // Routing
 // ============================================================================
 
-/// Returns (status_code, body).
-fn route(request: &[u8]) -> (u16, String) {
-    let Some((method, path)) = parse_request_line(request) else {
-        return (400, String::from("bad request line\n"));
+/// Returns (status_code, body, content_type).
+fn route(request: &[u8]) -> (u16, String, &'static str) {
+    let Some((method, path, body_offset)) = parse_request_head(request) else {
+        return (400, String::from("bad request\n"), "text/plain");
     };
 
     log(format!("[agentry-actor] {} {}", method, path));
 
+    // Static routes first
     match (method.as_str(), path.as_str()) {
-        ("GET", "/") => (200, String::from("agentry-actor alive\n")),
-        ("POST", "/sessions") => start_test_session(),
-        ("GET", "/sessions") => list_sessions(),
-        _ => (404, format!("no route for {} {}\n", method, path)),
-    }
-}
-
-fn start_test_session() -> (u16, String) {
-    // Phase 2: hardcoded spec just to prove the binding works.
-    let spec = ContainerSpec {
-        image: String::from("docker.io/library/alpine:latest"),
-        name: String::from("agentry-test"),
-        env: vec![],
-        mounts: vec![],
-        cmd: vec![String::from("sleep"), String::from("60")],
-        tty: false,
-        interactive: false,
-    };
-    match podman_run(spec) {
-        Ok(id) => (201, format!("started {}\n", id)),
-        Err(e) => (500, format!("podman.run failed: {}\n", e)),
-    }
-}
-
-fn list_sessions() -> (u16, String) {
-    match podman_list() {
-        Ok(containers) => {
-            let mut body = String::new();
-            for c in &containers {
-                body.push_str(&format!(
-                    "{}\t{}\t{}\t{}\n",
-                    c.name, c.status, c.image, c.id
-                ));
-            }
-            if body.is_empty() {
-                body.push_str("(no containers)\n");
-            }
-            (200, body)
+        ("GET", "/") => return (200, String::from("agentry-actor alive\n"), "text/plain"),
+        ("GET", "/sessions") => return list_sessions(),
+        ("POST", "/sessions") => {
+            let body_bytes = &request[body_offset..];
+            return start_session(body_bytes);
         }
-        Err(e) => (500, format!("podman.list failed: {}\n", e)),
+        _ => {}
     }
+
+    // /sessions/<name>
+    if let Some(name) = path.strip_prefix("/sessions/") {
+        if name.is_empty() {
+            return (
+                400,
+                json_error("missing session name in path"),
+                "application/json",
+            );
+        }
+        match method.as_str() {
+            "GET" => return show_session(name),
+            "DELETE" => return delete_session(name),
+            _ => {}
+        }
+    }
+
+    (
+        405,
+        json_error(&format!("method {} not allowed on {}", method, path)),
+        "application/json",
+    )
 }
 
 // ============================================================================
-// HTTP helpers
+// Endpoint handlers
 // ============================================================================
 
-fn parse_request_line(buf: &[u8]) -> Option<(String, String)> {
-    // First line: METHOD SP PATH SP HTTP/1.1 CRLF
+fn start_session(body: &[u8]) -> (u16, String, &'static str) {
+    let req: SessionRequest = match serde_json_core::from_slice(body) {
+        Ok((r, _)) => r,
+        Err(e) => {
+            return (
+                400,
+                json_error(&format!("invalid JSON body: {:?}", e)),
+                "application/json",
+            )
+        }
+    };
+
+    let spec = ContainerSpec {
+        image: req.image.to_string(),
+        name: req.name.to_string(),
+        env: req.env,
+        mounts: req
+            .mounts
+            .into_iter()
+            .map(|m| MountSpec {
+                source: m.source.to_string(),
+                target: m.target.to_string(),
+                read_only: m.read_only,
+            })
+            .collect(),
+        cmd: req.cmd,
+        tty: req.tty,
+        interactive: req.interactive,
+    };
+
+    let name = spec.name.clone();
+    match podman_run(spec) {
+        Ok(id) => {
+            let body = format!(
+                "{{\"name\":\"{}\",\"container_id\":\"{}\"}}\n",
+                escape_json(&name),
+                escape_json(&id)
+            );
+            (201, body, "application/json")
+        }
+        Err(e) => (
+            500,
+            json_error(&format!("podman.run failed: {}", e)),
+            "application/json",
+        ),
+    }
+}
+
+fn list_sessions() -> (u16, String, &'static str) {
+    let containers = match podman_list() {
+        Ok(cs) => cs,
+        Err(e) => {
+            return (
+                500,
+                json_error(&format!("podman.list failed: {}", e)),
+                "application/json",
+            )
+        }
+    };
+
+    let mut body = String::from("[");
+    for (i, c) in containers.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(&container_info_json(c));
+    }
+    body.push(']');
+    body.push('\n');
+    (200, body, "application/json")
+}
+
+fn show_session(name: &str) -> (u16, String, &'static str) {
+    let containers = match podman_list() {
+        Ok(cs) => cs,
+        Err(e) => {
+            return (
+                500,
+                json_error(&format!("podman.list failed: {}", e)),
+                "application/json",
+            )
+        }
+    };
+    match containers.iter().find(|c| c.name == name) {
+        Some(c) => (200, container_info_json(c) + "\n", "application/json"),
+        None => (404, json_error("no such session"), "application/json"),
+    }
+}
+
+fn delete_session(name: &str) -> (u16, String, &'static str) {
+    // Best-effort stop, then force-remove. podman host functions are
+    // already idempotent on "no such container", so this composes cleanly.
+    if let Err(e) = podman_stop(name.to_string()) {
+        return (
+            500,
+            json_error(&format!("podman.stop failed: {}", e)),
+            "application/json",
+        );
+    }
+    if let Err(e) = podman_rm(name.to_string(), true) {
+        return (
+            500,
+            json_error(&format!("podman.rm failed: {}", e)),
+            "application/json",
+        );
+    }
+    (204, String::new(), "application/json")
+}
+
+// ============================================================================
+// JSON helpers (hand-rolled — bodies are simple, no nested escaping needed)
+// ============================================================================
+
+fn container_info_json(c: &ContainerInfo) -> String {
+    format!(
+        "{{\"name\":\"{}\",\"image\":\"{}\",\"status\":\"{}\",\"exit_code\":{},\"container_id\":\"{}\"}}",
+        escape_json(&c.name),
+        escape_json(&c.image),
+        escape_json(&c.status),
+        c.exit_code,
+        escape_json(&c.id),
+    )
+}
+
+fn json_error(msg: &str) -> String {
+    format!("{{\"error\":\"{}\"}}\n", escape_json(msg))
+}
+
+/// Escape just the JSON-required chars in string values. We don't expect
+/// control chars in the inputs we care about; this is enough.
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+// ============================================================================
+// HTTP parsing
+// ============================================================================
+
+/// Parse the request line + skip headers. Returns (method, path, body_offset).
+fn parse_request_head(buf: &[u8]) -> Option<(String, String, usize)> {
+    // Request line ends at the first \r\n.
     let crlf = buf.windows(2).position(|w| w == b"\r\n")?;
     let line = core::str::from_utf8(&buf[..crlf]).ok()?;
     let mut parts = line.split(' ');
-    let method = parts.next()?;
-    let path = parts.next()?;
-    Some((method.to_string(), path.to_string()))
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+
+    // Body begins after the blank line (\r\n\r\n).
+    let body_offset = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(buf.len());
+
+    Some((method, path, body_offset))
 }
 
-fn format_response(status: u16, body: &str) -> String {
+fn format_response(status: u16, body: &str, content_type: &str) -> String {
     let reason = match status {
         200 => "OK",
         201 => "Created",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         500 => "Internal Server Error",
         _ => "Unknown",
     };
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status,
-        reason,
-        body.len(),
-        body
-    )
+    if status == 204 {
+        format!("HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+    } else {
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            reason,
+            content_type,
+            body.len(),
+            body
+        )
+    }
 }
