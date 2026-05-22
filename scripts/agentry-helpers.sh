@@ -8,6 +8,7 @@
 
 : "${AGENTRY_ACTOR_URL:=http://127.0.0.1:8090}"
 : "${AGENTRY_RECIPES:=$HOME/.config/agentry/recipes}"
+: "${AGENTRY_WORKSPACES:=$HOME/work/agentry-workspaces}"
 : "${AGENTRY_IMAGE:=localhost/agent-poc:latest}"
 : "${INBOX_TOKEN_FILE:=$HOME/.config/inbox/token}"
 
@@ -26,6 +27,12 @@ agentry-spawn() {
   local inbox_token
   inbox_token=$(<"$INBOX_TOKEN_FILE")
 
+  local workspace="$AGENTRY_WORKSPACES/$recipe"
+  if [ ! -d "$workspace" ]; then
+    echo "agentry-spawn: no workspace at $workspace (clone the repo there first)" >&2
+    return 1
+  fi
+
   # Hand-rolled JSON. None of these fields can contain JSON-special chars
   # in normal usage (token is hex, paths don't have quotes/backslashes).
   # If that assumption breaks, switch to jq.
@@ -37,12 +44,15 @@ agentry-spawn() {
     "mounts": [
       {"source":"%s/.claude.json","target":"/root/.claude.json","read_only":false},
       {"source":"%s/.claude","target":"/root/.claude","read_only":false},
-      {"source":"%s","target":"/workspace/CLAUDE.md","read_only":true}
+      {"source":"%s","target":"/workspace","read_only":false},
+      {"source":"%s","target":"/workspace/CLAUDE.md","read_only":true},
+      {"source":"%s/.config/gh","target":"/root/.config/gh","read_only":false},
+      {"source":"%s/.ssh","target":"/root/.ssh","read_only":true}
     ],
-    "cmd": ["claude"],
+    "cmd": ["claude", "begin"],
     "tty": true,
     "interactive": true
-  }' "$AGENTRY_IMAGE" "$recipe" "$inbox_token" "$HOME" "$HOME" "$claude_md"
+  }' "$AGENTRY_IMAGE" "$recipe" "$inbox_token" "$HOME" "$HOME" "$workspace" "$claude_md" "$HOME" "$HOME"
 
   curl -sS -X POST -H 'Content-Type: application/json' \
     --data "$spec" \
