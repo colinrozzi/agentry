@@ -1,0 +1,11 @@
+[package]
+name = "agentry-actor"
+version = "0.1.0"
+edition = "2021"
+description = "Theater WASM actor that orchestrates local AI agent containers via podman."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+packr-guest = { version = "0.6", features = ["derive"] }

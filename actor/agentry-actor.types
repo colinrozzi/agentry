@@ -1,0 +1,48 @@
+// agentry-actor type metadata.
+
+imports {
+    theater:simple/runtime {
+        log: func(msg: string),
+    }
+
+    theater:simple/tcp {
+        listen: func(address: string) -> result<string, string>,
+        activate: func(connection-id: string) -> result<_, string>,
+        receive: func(connection-id: string, max-bytes: u32) -> result<list<u8>, string>,
+        send: func(connection-id: string, data: list<u8>) -> result<u64, string>,
+        close: func(connection-id: string) -> result<_, string>,
+    }
+
+    theater:simple/podman {
+        record mount-spec {
+            source: string,
+            target: string,
+            read-only: bool,
+        }
+        record container-spec {
+            image: string,
+            name: string,
+            env: list<tuple<string, string>>,
+            mounts: list<mount-spec>,
+            cmd: list<string>,
+            tty: bool,
+            interactive: bool,
+        }
+        record container-info {
+            id: string,
+            name: string,
+            image: string,
+            status: string,
+            exit-code: s32,
+        }
+        run: func(spec: container-spec) -> result<string, string>,
+        stop: func(name: string) -> result<_, string>,
+        rm: func(name: string, force: bool) -> result<_, string>,
+        list: func() -> result<list<container-info>, string>,
+    }
+}
+
+exports {
+    theater:simple/actor.init: func(state: value) -> result<actor-state, string>,
+    theater:simple/tcp-client.handle-connection: func(state: actor-state, connection-id: string) -> result<actor-state, string>,
+}
