@@ -1,0 +1,12 @@
+name = "agentry-actor"
+version = "0.1.0"
+package = "/home/colin/work/actors/agentry/target/wasm32-unknown-unknown/release/agentry_actor.wasm"
+
+[[handler]]
+type = "runtime"
+
+[[handler]]
+type = "tcp"
+
+[[handler]]
+type = "podman"

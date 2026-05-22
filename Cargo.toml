@@ -1,3 +1,7 @@
+[workspace]
+members = ["actor"]
+resolver = "2"
+
 [package]
 name = "agentry"
 version = "0.1.0"
@@ -19,3 +23,7 @@ anyhow = "1"
 directories = "5"
 uuid = { version = "1", features = ["v4"] }
 time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
