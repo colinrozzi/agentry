@@ -1,8 +1,14 @@
 //! CLI subcommand implementations.
+//!
+//! The lifecycle commands are a thin orchestrator over the recipe's declared
+//! steps: `start` runs `setup` then `launch`; `stop` runs the stored
+//! `teardown`; `list`/`show` run each session's `status`; `attach` runs its
+//! `attach`. Nothing here knows about jj or tmux — those live only in the
+//! recipe's default template (see `recipe.rs`).
 
 use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::recipe;
 use crate::session::{self, Session};
@@ -12,84 +18,32 @@ pub fn start(reference: &str, repo_override: Option<&str>, ticket: Option<&str>)
     let recipe = recipe::resolve(reference)?;
     let repo = repo_override
         .map(PathBuf::from)
-        .or_else(|| recipe.repository.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "no repository specified — recipe '{}' has no default; pass --repo",
-                recipe.name
-            )
-        })?;
-    let claude_md_src = recipe.claude_md_abs()?;
-    if !claude_md_src.exists() {
-        return Err(anyhow!(
-            "recipe's CLAUDE.md not found at {}",
-            claude_md_src.display()
-        ));
-    }
-    if !repo.exists() {
-        return Err(anyhow!("repository not found: {}", repo.display()));
+        .or_else(|| recipe.repository.clone());
+    if let Some(r) = &repo {
+        if !r.exists() {
+            return Err(anyhow!("repository not found: {}", r.display()));
+        }
     }
 
     let uuid = uuid::Uuid::new_v4().to_string();
     let short = session::short_name(&uuid);
-    let tmux_session = format!("agent-{}", short);
-    let workspace_name = tmux_session.clone();
-    let worktree_root = session::worktree_root()?;
-    std::fs::create_dir_all(&worktree_root)
-        .with_context(|| format!("creating worktree root {}", worktree_root.display()))?;
-    let worktree = worktree_root.join(&uuid);
+    let sessions_root = session::sessions_root()?;
+    std::fs::create_dir_all(&sessions_root)
+        .with_context(|| format!("creating sessions root {}", sessions_root.display()))?;
 
-    // jj workspace add — sibling workspace on top of main, no branch pinning.
-    // Repo must be jj-colocated (git worktrees pin a branch and would block a
-    // second concurrent session on the same recipe).
-    let status = Command::new("jj")
-        .arg("-R")
-        .arg(&repo)
-        .arg("workspace")
-        .arg("add")
-        .arg("-r")
-        .arg("main")
-        .arg("--name")
-        .arg(&workspace_name)
-        .arg(&worktree)
-        .status()
-        .context("running jj workspace add")?;
-    if !status.success() {
-        return Err(anyhow!(
-            "jj workspace add failed (exit {:?})",
-            status.code()
-        ));
+    let plan = recipe.plan(&uuid, &short, &sessions_root, repo.as_deref())?;
+
+    // Run setup steps in order. On any failure, roll back with teardown.
+    for step in &plan.setup {
+        if !sh(step)? {
+            run_steps_best_effort(&plan.teardown);
+            return Err(anyhow!("setup step failed: {}", step));
+        }
     }
-
-    // Copy the recipe's CLAUDE.md into the worktree root
-    let claude_md_dst = worktree.join("CLAUDE.md");
-    std::fs::copy(&claude_md_src, &claude_md_dst)
-        .with_context(|| format!("copying CLAUDE.md to {}", claude_md_dst.display()))?;
-
-    // Start a detached tmux session running `claude` in the worktree
-    let status = Command::new("tmux")
-        .arg("new-session")
-        .arg("-d")
-        .arg("-s")
-        .arg(&tmux_session)
-        .arg("-c")
-        .arg(&worktree)
-        .arg("claude")
-        .status()
-        .context("running tmux new-session")?;
-    if !status.success() {
-        // Try to clean up the workspace if tmux didn't start
-        let _ = Command::new("jj")
-            .arg("-R")
-            .arg(&repo)
-            .args(["workspace", "forget"])
-            .arg(&workspace_name)
-            .status();
-        let _ = std::fs::remove_dir_all(&worktree);
-        return Err(anyhow!(
-            "tmux new-session failed (exit {:?})",
-            status.code()
-        ));
+    // Launch the runtime (detached). Roll back if it fails to start.
+    if !sh(&plan.launch)? {
+        run_steps_best_effort(&plan.teardown);
+        return Err(anyhow!("launch failed: {}", plan.launch));
     }
 
     let session = Session {
@@ -98,38 +52,38 @@ pub fn start(reference: &str, repo_override: Option<&str>, ticket: Option<&str>)
         recipe_name: recipe.name.clone(),
         recipe_path: recipe.source.clone(),
         repository: repo.clone(),
-        worktree: worktree.clone(),
-        tmux_session: tmux_session.clone(),
+        workdir: plan.workdir.clone(),
+        session_name: plan.session_name.clone(),
+        command: plan.command.clone(),
+        status_cmd: plan.status.clone(),
+        attach_cmd: plan.attach.clone(),
+        teardown: plan.teardown.clone(),
         started_at: session::now_rfc3339()?,
         linked_ticket: ticket.map(|s| s.to_string()),
     };
     session.save()?;
 
-    println!(
-        "spawned {} (recipe={}, repo={})",
-        short,
-        recipe.name,
-        repo.display()
-    );
-    println!("  worktree: {}", worktree.display());
-    println!("  tmux:     {}", tmux_session);
+    println!("spawned {} (recipe={})", short, recipe.name);
+    if let Some(r) = &repo {
+        println!("  repo:     {}", r.display());
+    }
+    println!("  workdir:  {}", plan.workdir.display());
+    println!("  session:  {}", plan.session_name);
     if let Some(t) = ticket {
         println!("  ticket:   {}", t);
     }
     println!();
     println!("attach with:  agentry attach {}", short);
-    println!("              tmux attach -t {}", tmux_session);
     Ok(())
 }
 
-/// List currently-running sessions.
+/// List currently-tracked sessions.
 pub fn list() -> Result<()> {
     let sessions = session::list_all()?;
     if sessions.is_empty() {
         println!("(no sessions)");
         return Ok(());
     }
-    let live: std::collections::HashSet<String> = tmux_alive_sessions()?.into_iter().collect();
 
     let name_w = sessions
         .iter()
@@ -144,28 +98,32 @@ pub fn list() -> Result<()> {
         .unwrap_or(6)
         .max(6);
     println!(
-        "{:<nw$}  {:<rw$}  status      ticket  started_at",
+        "{:<nw$}  {:<rw$}  {:<8}  {:<6}  started_at",
         "name",
         "recipe",
+        "status",
+        "ticket",
         nw = name_w,
         rw = recipe_w
     );
     println!(
-        "{:<nw$}  {:<rw$}  ------      ------  ----------",
+        "{:<nw$}  {:<rw$}  {:<8}  {:<6}  ----------",
         "----",
+        "------",
+        "------",
         "------",
         nw = name_w,
         rw = recipe_w
     );
     for s in sessions {
-        let status = if live.contains(&s.tmux_session) {
-            "running"
-        } else {
-            "stale  "
+        let status = match check_running(&effective_status_cmd(&s)) {
+            Some(true) => "running",
+            Some(false) => "stale",
+            None => "unknown",
         };
         let ticket = s.linked_ticket.as_deref().unwrap_or("-");
         println!(
-            "{:<nw$}  {:<rw$}  {}     {:<6}  {}",
+            "{:<nw$}  {:<rw$}  {:<8}  {:<6}  {}",
             s.name,
             s.recipe_name,
             status,
@@ -181,15 +139,26 @@ pub fn list() -> Result<()> {
 /// Show full state for one session.
 pub fn show(name: &str) -> Result<()> {
     let s = session::find(name)?;
-    let live = tmux_alive_sessions()?.contains(&s.tmux_session);
+    let status = match check_running(&effective_status_cmd(&s)) {
+        Some(true) => "running",
+        Some(false) => "stale",
+        None => "unknown",
+    };
     println!("name:          {}", s.name);
     println!("uuid:          {}", s.uuid);
-    println!("status:        {}", if live { "running" } else { "stale" });
+    println!("status:        {}", status);
     println!("recipe:        {}", s.recipe_name);
     println!("recipe_path:   {}", s.recipe_path.display());
-    println!("repository:    {}", s.repository.display());
-    println!("worktree:      {}", s.worktree.display());
-    println!("tmux:          {}", s.tmux_session);
+    println!(
+        "repository:    {}",
+        s.repository
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("workdir:       {}", s.workdir.display());
+    println!("session:       {}", s.session_name);
+    println!("command:       {}", s.command);
     println!("started_at:    {}", s.started_at);
     println!(
         "linked_ticket: {}",
@@ -198,47 +167,28 @@ pub fn show(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stop a session: kill tmux, forget jj workspace, remove worktree dir, delete state file.
+/// Stop a session: run its stored teardown, then delete the state file.
 pub fn stop(name: &str) -> Result<()> {
     let s = session::find(name)?;
-    // tmux kill-session — ignore failure (session may already be dead)
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t"])
-        .arg(&s.tmux_session)
-        .status();
-    // jj workspace forget — best-effort (session may have been created with an
-    // older agentry that used `git worktree add`, or already forgotten).
-    let _ = Command::new("jj")
-        .arg("-R")
-        .arg(&s.repository)
-        .args(["workspace", "forget"])
-        .arg(&s.tmux_session)
-        .status();
-    // Best-effort: also try git worktree remove for legacy sessions
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(&s.repository)
-        .args(["worktree", "remove", "--force"])
-        .arg(&s.worktree)
-        .status();
-    // Final sweep — make sure the directory is gone
-    let _ = std::fs::remove_dir_all(&s.worktree);
+    run_steps_best_effort(&s.teardown);
     s.delete()?;
-    println!("stopped {} (workspace removed, state file deleted)", s.name);
+    println!("stopped {} (teardown complete, state file deleted)", s.name);
     Ok(())
 }
 
-/// Attach the current terminal to an agent's tmux session.
+/// Attach the current terminal to a session via its declared attach command.
 pub fn attach(name: &str) -> Result<()> {
     let s = session::find(name)?;
-    // Exec tmux so the current terminal becomes the attached client.
-    let err = Command::new("tmux")
-        .args(["attach", "-t"])
-        .arg(&s.tmux_session)
+    if s.attach_cmd.trim().is_empty() {
+        return Err(anyhow!("session '{}' has no attach command", s.name));
+    }
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&s.attach_cmd)
         .status()
-        .context("running tmux attach")?;
-    if !err.success() {
-        return Err(anyhow!("tmux attach failed (exit {:?})", err.code()));
+        .with_context(|| format!("running attach command: {}", s.attach_cmd))?;
+    if !status.success() {
+        return Err(anyhow!("attach failed (exit {:?})", status.code()));
     }
     Ok(())
 }
@@ -281,25 +231,68 @@ pub fn recipes_show(reference: &str) -> Result<()> {
             .unwrap_or_else(|| "(none — must be supplied at spawn)".to_string())
     );
     println!("source:      {}", recipe.source.display());
-    println!("claude.md:   {}", recipe.claude_md_abs()?.display());
+    println!(
+        "claude.md:   {}",
+        recipe
+            .claude_md_abs()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    let overrides = recipe.overrides();
+    println!(
+        "lifecycle:   {}",
+        if overrides.is_empty() {
+            "default (jj workspace + tmux)".to_string()
+        } else {
+            format!("custom: {}", overrides.join(", "))
+        }
+    );
     Ok(())
 }
 
-/// Query tmux for currently-running session names. Returns empty if tmux
-/// isn't available or has no sessions.
-fn tmux_alive_sessions() -> Result<Vec<String>> {
-    let out = Command::new("tmux")
-        .args(["ls", "-F", "#{session_name}"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            Ok(stdout
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|s| s.to_string())
-                .collect())
-        }
-        _ => Ok(Vec::new()),
+/// Run a single step through `sh -c`, returning whether it succeeded.
+fn sh(cmd: &str) -> Result<bool> {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .with_context(|| format!("running: {}", cmd))?;
+    Ok(status.success())
+}
+
+/// Run steps through `sh -c`, ignoring individual failures (used for teardown
+/// and rollback — each step should be independently best-effort).
+fn run_steps_best_effort(steps: &[String]) {
+    for step in steps {
+        let _ = Command::new("sh").arg("-c").arg(step).status();
+    }
+}
+
+/// The status command to actually run for a session. Legacy state files (from
+/// before the lifecycle engine) carry no `status_cmd`; every such session was a
+/// tmux session, so fall back to a tmux liveness check keyed on its name.
+fn effective_status_cmd(s: &Session) -> String {
+    if s.status_cmd.trim().is_empty() && !s.session_name.trim().is_empty() {
+        format!("tmux has-session -t {}", s.session_name)
+    } else {
+        s.status_cmd.clone()
+    }
+}
+
+/// Run a session's status command. `Some(true)` = running, `Some(false)` =
+/// stale, `None` = no status command (unknown). Output is suppressed.
+fn check_running(status_cmd: &str) -> Option<bool> {
+    if status_cmd.trim().is_empty() {
+        return None;
+    }
+    match Command::new("sh")
+        .arg("-c")
+        .arg(status_cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(s) => Some(s.success()),
+        Err(_) => Some(false),
     }
 }
