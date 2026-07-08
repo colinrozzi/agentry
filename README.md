@@ -4,9 +4,24 @@ A small CLI tool for managing local AI agent sessions: recipes, jj workspaces, a
 
 Designed for the one-human, one-machine case — you sit at your laptop, want to spin up agents on demand for specific tasks or as long-lived specialists, see what's running, and tear them down cleanly. No service, no central coordinator; just a tool.
 
+## Getting started
+
+```sh
+agentry init                         # seed your first recipe (onboarding-agent)
+agentry start onboarding-agent       # spawn it — a plain-dir agent, no jj needed
+agentry list                         # find its name
+agentry attach <name>                # attach and ask it about agentry
+```
+
+`agentry init` writes a starter `onboarding-agent` recipe into your recipes
+directory. It's an interactive guide to the tool *and* a worked example of the
+recipe format — spawn it, attach, and it'll walk you through the rest.
+
 ## Commands
 
 ```sh
+agentry init [--force]               # seed the onboarding-agent recipe
+
 agentry recipes list                 # enumerate recipes in the search path
 agentry recipes show <name|path>     # show one recipe's metadata + paths
 

@@ -1,0 +1,24 @@
+# The onboarding-agent recipe, seeded by `agentry init`.
+#
+# It's a plain-directory agent: no jj, no repository, works on any machine. It
+# also doubles as a worked example of the recipe format — open it to see how a
+# recipe overrides the lifecycle (here: `setup`/`teardown`), while `launch`,
+# `status`, and `attach` are omitted so they fall back to the tmux defaults.
+
+name = "onboarding-agent"
+description = "Meet agentry — an interactive guide to recipes, sessions, and the lifecycle"
+claude_md_path = "./CLAUDE.md"
+
+# Provision a throwaway working directory and drop the guide into it.
+setup = [
+    "mkdir -p {workdir}",
+    "cp {claude_md} {workdir}/CLAUDE.md",
+]
+
+# Tear it down when the session stops.
+teardown = [
+    "tmux kill-session -t {session}",
+    "rm -rf {workdir}",
+]
+
+# launch / status / attach / command are unset ⇒ tmux runtime running `claude`.

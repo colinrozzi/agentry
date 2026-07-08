@@ -13,6 +13,54 @@ use std::process::{Command, Stdio};
 use crate::recipe;
 use crate::session::{self, Session};
 
+/// The starter recipe seeded by `agentry init`, embedded at build time.
+const ONBOARDING_RECIPE_TOML: &str = include_str!("assets/onboarding-agent.recipe.toml");
+const ONBOARDING_CLAUDE_MD: &str = include_str!("assets/onboarding-agent.CLAUDE.md");
+
+/// Seed the recipes directory with the onboarding-agent recipe, so a fresh
+/// install has something to spawn and a worked example to learn the format from.
+pub fn init(force: bool) -> Result<()> {
+    let recipes_root = recipe::search_path()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("could not determine a recipes directory"))?;
+    let dir = recipes_root.join("onboarding-agent");
+    let recipe_toml = dir.join("recipe.toml");
+    let claude_md = dir.join("CLAUDE.md");
+
+    if recipe_toml.exists() && !force {
+        println!(
+            "onboarding-agent recipe already exists at {}",
+            recipe_toml.display()
+        );
+        println!("(pass --force to overwrite)");
+        println!();
+        print_next_steps();
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating recipe dir {}", dir.display()))?;
+    std::fs::write(&recipe_toml, ONBOARDING_RECIPE_TOML)
+        .with_context(|| format!("writing {}", recipe_toml.display()))?;
+    std::fs::write(&claude_md, ONBOARDING_CLAUDE_MD)
+        .with_context(|| format!("writing {}", claude_md.display()))?;
+
+    println!("seeded onboarding-agent recipe at {}", dir.display());
+    println!("  recipe: {}", recipe_toml.display());
+    println!("  guide:  {}", claude_md.display());
+    println!();
+    print_next_steps();
+    Ok(())
+}
+
+fn print_next_steps() {
+    println!("next steps:");
+    println!("  agentry start onboarding-agent   # spawn a session from it");
+    println!("  agentry list                     # find its name");
+    println!("  agentry attach <name>            # talk to it");
+}
+
 /// Spawn a new agent session.
 pub fn start(reference: &str, repo_override: Option<&str>, ticket: Option<&str>) -> Result<()> {
     let recipe = recipe::resolve(reference)?;

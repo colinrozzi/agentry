@@ -16,6 +16,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Seed the recipes directory with a starter onboarding-agent recipe.
+    Init {
+        /// Overwrite the onboarding-agent recipe if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Manage recipes (agent identity templates).
     Recipes {
         #[command(subcommand)]
@@ -72,6 +79,7 @@ enum RecipesCmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Init { force } => cmd::init(force),
         Cmd::Recipes { cmd } => match cmd {
             RecipesCmd::List => cmd::recipes_list(),
             RecipesCmd::Show { recipe } => cmd::recipes_show(&recipe),
