@@ -21,7 +21,8 @@ agentry stop <name>                  # kill tmux, forget workspace, delete state
 
 ### Recipe
 
-A recipe is the identity template for an agent. It's a `recipe.toml` file that can live anywhere on disk:
+A recipe is the instantiation document for an agent — think of it as the agent's
+Dockerfile. It's a `recipe.toml` file that can live anywhere on disk:
 
 ```toml
 name = "inbox-dev"
@@ -36,6 +37,45 @@ Two shapes naturally emerge:
 
 The directory containing `recipe.toml` is purely organizational; the tool only cares about the file and the paths it references.
 
+### The lifecycle engine
+
+agentry itself knows nothing about jj or tmux. A session's whole lifecycle is a
+set of **declared shell steps** the recipe can override:
+
+| field | when it runs | default (if unset) |
+|---|---|---|
+| `setup` | at `start`, to provision the workspace | `jj workspace add -r main` + copy `CLAUDE.md` |
+| `launch` | at `start`, to start the (detached) runtime | `tmux new-session -d … {command}` |
+| `status` | at `list`/`show`, for liveness (exit 0 = alive) | `tmux has-session` |
+| `attach` | at `attach`, to connect interactively | `tmux attach` |
+| `teardown` | at `stop` (best-effort), to reverse setup | kill tmux, `jj workspace forget`, `rm` |
+| `command` | the process run inside the session | `claude` |
+| `workdir` | the session's working directory | `{sessions_root}/{uuid}` |
+
+A recipe that declares **none** of these inherits the full jj + tmux default, so
+existing recipes work untouched. Override just one verb (or all of them) to get a
+different shape — a plain-directory agent, a cloud runtime, whatever. Steps are
+run through `sh -c` with `{var}` placeholders substituted:
+
+```toml
+# a plain-directory agent — no jj, no repo required
+name = "onboarding-agent"
+description = "Meet agentry"
+claude_md_path = "./CLAUDE.md"
+setup    = ["mkdir -p {workdir}", "cp {claude_md} {workdir}/CLAUDE.md"]
+teardown = ["tmux kill-session -t {session}", "rm -rf {workdir}"]
+# launch/status/attach unset ⇒ tmux runtime by default
+```
+
+**Template variables:** `{uuid}` `{short}` `{session}` (=`agent-{short}`)
+`{workdir}` `{sessions_root}` `{recipe_dir}` `{claude_md}` `{repo}` `{command}`.
+A `{name}` outside this set (e.g. shell `${HOME}`) is left untouched; a *known*
+variable that's referenced but unset (e.g. `{repo}` with no `repository`) is an
+error at spawn time.
+
+Steps run as shell on your machine — recipes are trusted local files you author,
+same as the `claude` process they launch.
+
 ### Search path
 
 `agentry start <name>` and `agentry recipes list` look in (in order):
@@ -46,15 +86,21 @@ You can also bypass the search path: `agentry start /tmp/my-recipe.toml`.
 
 ### Session lifecycle
 
-When you `agentry start <recipe>`:
-1. Create a jj workspace at `~/work/agentry-sessions/<uuid>/` based on `main` of the recipe's repository (named `agent-<short>` in `jj workspace list`)
-2. Copy the recipe's `CLAUDE.md` into the workspace root
-3. Start a detached tmux session named `agent-<short>` running `claude` in the workspace
-4. Write a state file at `~/.local/state/agentry/<short>.json` with the session's metadata
+When you `agentry start <recipe>`, agentry resolves the recipe's plan
+(substituting `{var}` placeholders) and then:
+1. Runs each `setup` step in order (default: create a jj workspace at `~/work/agentry-sessions/<uuid>/` on `main`, copy `CLAUDE.md` in). If any step fails, it runs `teardown` to roll back.
+2. Runs `launch` (default: a detached tmux session `agent-<short>` running `claude` in the workspace).
+3. Writes a state file at `~/.local/state/agentry/<short>.json` — including the *resolved* `status`/`attach`/`teardown` commands, so the lifecycle commands never need to re-read the recipe.
 
-`agentry list` reads state files + queries tmux to show what's running. `agentry attach <name>` is a shortcut for `tmux attach -t agent-<name>`. `agentry stop <name>` kills the tmux session, forgets the jj workspace, deletes the worktree directory, and removes the state file.
+`agentry list`/`show` run each session's `status` command for liveness.
+`agentry attach <name>` runs its `attach` command. `agentry stop <name>` runs the
+stored `teardown` steps (best-effort) and removes the state file.
 
-The repo must be jj-colocated. We use `jj workspace add` rather than `git worktree add` so that multiple sessions can coexist on top of `main` without git's "one worktree per branch" restriction.
+For the default (jj) workspace strategy, the repo must be jj-colocated. We use
+`jj workspace add` rather than `git worktree add` so that multiple sessions can
+coexist on top of `main` without git's "one worktree per branch" restriction. A
+recipe that overrides `setup`/`teardown` (e.g. a plain-directory or cloud agent)
+has no such requirement.
 
 ## Build & install
 

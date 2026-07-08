@@ -1,4 +1,8 @@
 //! Session state — per-session JSON files persisted on disk.
+//!
+//! A session stores its own *resolved* lifecycle verbs (status/attach/teardown)
+//! so the lifecycle commands (`list`, `attach`, `stop`) never need to re-read
+//! the recipe — which may have moved, changed, or been deleted since spawn.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,20 +13,36 @@ use std::path::{Path, PathBuf};
 pub struct Session {
     /// Full UUID for the session.
     pub uuid: String,
-    /// Short name used for tmux session + CLI lookup (8 hex chars of uuid).
+    /// Short name used for the session name + CLI lookup (8 chars of uuid).
     pub name: String,
     /// Recipe identity.
     pub recipe_name: String,
     pub recipe_path: PathBuf,
-    /// Repository the worktree was based on.
-    pub repository: PathBuf,
-    /// Worktree path created for this session.
-    pub worktree: PathBuf,
-    /// tmux session name (`agent-<short>`).
-    pub tmux_session: String,
+    /// Repository the session was based on, if any.
+    #[serde(default)]
+    pub repository: Option<PathBuf>,
+    /// Working directory created for this session.
+    #[serde(alias = "worktree")]
+    pub workdir: PathBuf,
+    /// Session/runtime name (`agent-<short>`).
+    #[serde(alias = "tmux_session")]
+    pub session_name: String,
+    /// The command run inside the session.
+    #[serde(default)]
+    pub command: String,
+    /// Resolved liveness command — exit 0 means running. Empty ⇒ unknown.
+    #[serde(default)]
+    pub status_cmd: String,
+    /// Resolved interactive-attach command. Empty ⇒ no attach.
+    #[serde(default)]
+    pub attach_cmd: String,
+    /// Resolved teardown steps, run best-effort on `stop`.
+    #[serde(default)]
+    pub teardown: Vec<String>,
     /// RFC3339 start timestamp.
     pub started_at: String,
     /// Optional linked ticket id.
+    #[serde(default)]
     pub linked_ticket: Option<String>,
 }
 
@@ -98,9 +118,8 @@ pub fn now_rfc3339() -> Result<String> {
     now.format(&Rfc3339).context("formatting timestamp")
 }
 
-/// Convenience for callers wanting to derive paths from a path arg or name.
-#[allow(dead_code)]
-pub fn worktree_root() -> Result<PathBuf> {
+/// Root under which per-session working directories are created.
+pub fn sessions_root() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     Ok(Path::new(&home).join("work/agentry-sessions"))
 }
