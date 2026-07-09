@@ -16,6 +16,34 @@ use crate::session::{self, Session};
 /// The starter recipe seeded by `agentry init`, embedded at build time.
 const ONBOARDING_RECIPE_TOML: &str = include_str!("assets/onboarding-agent.recipe.toml");
 const ONBOARDING_CLAUDE_MD: &str = include_str!("assets/onboarding-agent.CLAUDE.md");
+/// The default agent image's Dockerfile, embedded at build time.
+const AGENT_DOCKERFILE: &str = include_str!("assets/agent.Dockerfile");
+
+/// Build the default agent image (`agentry-agent:latest`) from the bundled
+/// Dockerfile using the detected container engine.
+pub fn image_build() -> Result<()> {
+    let engine = recipe::container_engine().ok_or_else(|| {
+        anyhow!("no container engine found — install docker or podman, or set AGENTRY_CONTAINER_ENGINE")
+    })?;
+    let dir = std::env::temp_dir().join(format!("agentry-image-build-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating build context {}", dir.display()))?;
+    std::fs::write(dir.join("Dockerfile"), AGENT_DOCKERFILE)
+        .with_context(|| format!("writing Dockerfile to {}", dir.display()))?;
+
+    println!("building agentry-agent:latest with {} …", engine);
+    let ok = Command::new(&engine)
+        .args(["build", "-t", "agentry-agent:latest"])
+        .arg(&dir)
+        .status()
+        .with_context(|| format!("running {} build", engine));
+    let _ = std::fs::remove_dir_all(&dir);
+    if !ok?.success() {
+        return Err(anyhow!("image build failed"));
+    }
+    println!("built agentry-agent:latest");
+    Ok(())
+}
 
 /// Seed the recipes directory with the onboarding-agent recipe, so a fresh
 /// install has something to spawn and a worked example to learn the format from.
@@ -34,31 +62,56 @@ pub fn init(force: bool) -> Result<()> {
             recipe_toml.display()
         );
         println!("(pass --force to overwrite)");
-        println!();
-        print_next_steps();
-        return Ok(());
+    } else {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating recipe dir {}", dir.display()))?;
+        std::fs::write(&recipe_toml, ONBOARDING_RECIPE_TOML)
+            .with_context(|| format!("writing {}", recipe_toml.display()))?;
+        std::fs::write(&claude_md, ONBOARDING_CLAUDE_MD)
+            .with_context(|| format!("writing {}", claude_md.display()))?;
+        println!("seeded onboarding-agent recipe at {}", dir.display());
+        println!("  recipe: {}", recipe_toml.display());
+        println!("  guide:  {}", claude_md.display());
     }
-
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating recipe dir {}", dir.display()))?;
-    std::fs::write(&recipe_toml, ONBOARDING_RECIPE_TOML)
-        .with_context(|| format!("writing {}", recipe_toml.display()))?;
-    std::fs::write(&claude_md, ONBOARDING_CLAUDE_MD)
-        .with_context(|| format!("writing {}", claude_md.display()))?;
-
-    println!("seeded onboarding-agent recipe at {}", dir.display());
-    println!("  recipe: {}", recipe_toml.display());
-    println!("  guide:  {}", claude_md.display());
     println!();
+    check_container_prereqs();
     print_next_steps();
     Ok(())
 }
 
+/// Agents run in containers by default, so warn early (at `init`) if the
+/// container engine or the agent image isn't ready.
+fn check_container_prereqs() {
+    let engine = match recipe::container_engine() {
+        Some(e) => e,
+        None => {
+            println!("⚠  No container engine found (docker/podman).");
+            println!("   agentry runs agents in containers by default — install docker or");
+            println!("   podman, or set AGENTRY_CONTAINER_ENGINE (or use runtime = \"foreground\").");
+            println!();
+            return;
+        }
+    };
+    let image_present = Command::new(&engine)
+        .args(["image", "inspect", "agentry-agent:latest"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !image_present {
+        println!("⚠  The agent image `agentry-agent:latest` isn't built yet.");
+        println!("   Build it once (installs claude inside the image):");
+        println!("     agentry image build");
+        println!();
+    }
+}
+
 fn print_next_steps() {
     println!("next steps:");
-    println!("  agentry start onboarding-agent   # spawn a session from it");
-    println!("  agentry list                     # find its name");
-    println!("  agentry attach <name>            # talk to it");
+    println!("  agentry image build              # build the agent image (once, if needed)");
+    println!("  agentry start onboarding-agent   # spawn it in a container");
+    println!("  agentry attach <name>            # attach and chat (name from `agentry list`)");
 }
 
 /// Spawn a new agent session.
@@ -88,7 +141,41 @@ pub fn start(reference: &str, repo_override: Option<&str>, ticket: Option<&str>)
             return Err(anyhow!("setup step failed: {}", step));
         }
     }
-    // Launch the runtime (detached). Roll back if it fails to start.
+
+    if plan.runtime == recipe::Runtime::Foreground {
+        // Foreground: run the command in this terminal, tear down on exit.
+        // No state file — the session lives only as long as the process.
+        println!(
+            "starting {} (recipe={}) in {}",
+            short,
+            recipe.name,
+            plan.workdir.display()
+        );
+        println!("(foreground session — it ends when you exit the agent)\n");
+        let ran = Command::new("sh")
+            .arg("-c")
+            .arg(&plan.command)
+            .current_dir(&plan.workdir)
+            .status()
+            .with_context(|| format!("running command: {}", plan.command));
+        run_steps_best_effort(&plan.teardown);
+        let ran = ran?;
+        if !ran.success() {
+            return Err(anyhow!("agent exited with status {:?}", ran.code()));
+        }
+        return Ok(());
+    }
+
+    // Detached (container or shell): background the runtime, then track it.
+    // The container runtime always has a launch; a shell recipe must declare one.
+    if plan.launch.trim().is_empty() {
+        run_steps_best_effort(&plan.teardown);
+        return Err(anyhow!(
+            "recipe '{}' uses runtime = \"shell\" but declares no `launch`; \
+             declare how to background the runtime (e.g. a tmux new-session)",
+            recipe.name
+        ));
+    }
     if !sh(&plan.launch)? {
         run_steps_best_effort(&plan.teardown);
         return Err(anyhow!("launch failed: {}", plan.launch));
@@ -111,7 +198,12 @@ pub fn start(reference: &str, repo_override: Option<&str>, ticket: Option<&str>)
     };
     session.save()?;
 
-    println!("spawned {} (recipe={})", short, recipe.name);
+    println!(
+        "spawned {} (recipe={}, {})",
+        short,
+        recipe.name,
+        plan.runtime.as_str()
+    );
     if let Some(r) = &repo {
         println!("  repo:     {}", r.display());
     }
@@ -120,8 +212,9 @@ pub fn start(reference: &str, repo_override: Option<&str>, ticket: Option<&str>)
     if let Some(t) = ticket {
         println!("  ticket:   {}", t);
     }
-    println!();
-    println!("attach with:  agentry attach {}", short);
+    if !plan.attach.trim().is_empty() {
+        println!("\nattach with:  agentry attach {}", short);
+    }
     Ok(())
 }
 
@@ -286,15 +379,23 @@ pub fn recipes_show(reference: &str) -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(none)".to_string())
     );
-    let overrides = recipe.overrides();
-    println!(
-        "lifecycle:   {}",
-        if overrides.is_empty() {
-            "default (jj workspace + tmux)".to_string()
-        } else {
-            format!("custom: {}", overrides.join(", "))
-        }
-    );
+    println!("runtime:     {}", recipe.runtime.as_str());
+    if recipe.runtime == recipe::Runtime::Container {
+        println!(
+            "image:       {}",
+            recipe.image.as_deref().unwrap_or("agentry-agent:latest (default)")
+        );
+    } else {
+        let overrides = recipe.overrides();
+        println!(
+            "lifecycle:   {}",
+            if overrides.is_empty() {
+                "default".to_string()
+            } else {
+                format!("custom: {}", overrides.join(", "))
+            }
+        );
+    }
     Ok(())
 }
 
