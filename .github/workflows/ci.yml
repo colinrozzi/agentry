@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Scope to the agentry package; the `actor` workspace member is a separate
+      # WASM target built elsewhere.
+      - name: rustfmt
+        run: cargo fmt -p agentry --check
+
+      - name: clippy
+        run: cargo clippy -p agentry --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test -p agentry
+
+      - name: build
+        run: cargo build -p agentry --release

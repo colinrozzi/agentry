@@ -129,3 +129,17 @@ pub fn sessions_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("could not determine base dirs"))?;
     Ok(dirs.data_dir().join("agentry/sessions"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_name_takes_first_eight_alphanumerics() {
+        assert_eq!(
+            short_name("abcd1234-5678-90ab-cdef-000000000000"),
+            "abcd1234"
+        );
+        assert_eq!(short_name("ab-cd-ef-12"), "abcdef12");
+    }
+}
