@@ -2,14 +2,16 @@
 //!
 //! A recipe is the instantiation document for an agent — its Dockerfile. It's a
 //! TOML file describing an agent template: identity (name, description, a
-//! CLAUDE.md guide) plus an optional, fully-declarative lifecycle expressed as
-//! shell steps: `setup`, `launch`, `status`, `attach`, `teardown`.
+//! CLAUDE.md guide) plus a `runtime` that decides how the agent runs.
 //!
-//! agentry itself knows nothing about jj or tmux. Those live only in the
-//! built-in default template below: a recipe that declares no lifecycle verbs
-//! inherits today's behavior (jj workspace + tmux session running `claude`), so
-//! existing recipes keep working untouched. A recipe that *does* declare a verb
-//! overrides just that verb — a `dir` workspace, a cloud runtime, whatever.
+//! - `container` (default): agentry runs the agent in a docker/podman container
+//!   with `~/.claude` and the working directory mounted in — see
+//!   [`Recipe::container_steps`].
+//! - `foreground`: runs `command` (default `claude`) in your terminal, tearing
+//!   down on exit. Zero-dependency, not tracked.
+//! - `shell`: the recipe declares its own lifecycle as shell steps (`setup`,
+//!   `launch`, `status`, `attach`, `teardown`) — the escape hatch for tmux, jj
+//!   workspaces, cloud runners, anything.
 //!
 //! Steps are templated with `{var}` placeholders and run through `sh -c`.
 
@@ -18,29 +20,21 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-/// The command run inside the session (inside tmux, for the default runtime).
+/// Default agent image for the container runtime (built from the repo's
+/// `Dockerfile`; see `agentry image build`).
+const DEFAULT_IMAGE: &str = "agentry-agent:latest";
+
+/// The command run inside the session.
 const DEFAULT_COMMAND: &str = "claude";
 /// Where the session's working directory lives.
 const DEFAULT_WORKDIR: &str = "{sessions_root}/{uuid}";
-/// Default workspace provisioning: a sibling jj workspace on `main`, plus a
-/// copy of the recipe's CLAUDE.md into the workspace root.
-const DEFAULT_SETUP: &[&str] = &[
-    "jj -R {repo} workspace add -r main --name {session} {workdir}",
-    "cp {claude_md} {workdir}/CLAUDE.md",
-];
-/// Default runtime: a detached tmux session running `{command}` in `{workdir}`.
-const DEFAULT_LAUNCH: &str = "tmux new-session -d -s {session} -c {workdir} {command}";
-/// Default liveness check: exit 0 if the tmux session exists.
-const DEFAULT_STATUS: &str = "tmux has-session -t {session}";
-/// Default interactive attach.
-const DEFAULT_ATTACH: &str = "tmux attach -t {session}";
-/// Default teardown: kill the tmux session, forget the jj workspace, remove dir.
-const DEFAULT_TEARDOWN: &[&str] = &[
-    "tmux kill-session -t {session}",
-    "jj -R {repo} workspace forget {session}",
-    "rm -rf {workdir}",
-];
+/// Default workspace provisioning: just ensure the working directory exists.
+/// agentry bakes in no jj/tmux — recipes declare any real provisioning.
+const DEFAULT_SETUP: &[&str] = &["mkdir -p {workdir}"];
+/// Default teardown: remove the working directory.
+const DEFAULT_TEARDOWN: &[&str] = &["rm -rf {workdir}"];
 
 /// The fixed vocabulary of template variables. A `{name}` whose name is in this
 /// set is substituted (or errors, if referenced but unset); any other `{...}` —
@@ -56,6 +50,37 @@ const KNOWN_VARS: &[&str] = &[
     "repo",
     "command",
 ];
+
+/// How agentry runs a session's agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Runtime {
+    /// Built-in: run the agent inside a container (docker/podman), isolated,
+    /// with `~/.claude` and the working directory mounted in. Default.
+    Container,
+    /// Run the agent in your terminal, tearing down on exit. Zero-dependency;
+    /// not tracked by `list`/`attach`/`stop`.
+    Foreground,
+    /// Run the recipe's own declared `setup`/`launch`/`status`/`attach`/
+    /// `teardown` steps — the escape hatch for tmux, cloud runners, anything.
+    Shell,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Runtime::Container
+    }
+}
+
+impl Runtime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Runtime::Container => "container",
+            Runtime::Foreground => "foreground",
+            Runtime::Shell => "shell",
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Recipe {
@@ -77,28 +102,41 @@ pub struct Recipe {
     #[serde(default)]
     pub claude_md_path: Option<PathBuf>,
 
-    // ---- Lifecycle (all optional; unset ⇒ the built-in default template) ----
+    /// How to run the agent. Default `container`.
+    #[serde(default)]
+    pub runtime: Runtime,
+
     /// Command run inside the session. Default `claude`.
     #[serde(default)]
     pub command: Option<String>,
-    /// The session's working directory. Default `{sessions_root}/{uuid}`.
+    /// The session's working directory (mounted into the container for the
+    /// container runtime). Default `{sessions_root}/{uuid}`.
     #[serde(default)]
     pub workdir: Option<String>,
-    /// Steps to provision the workspace. Default: jj workspace + copy CLAUDE.md.
+
+    // ---- Container runtime knobs ----
+    /// Container image to run. Default `agentry-agent:latest`.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Extra bind mounts (`host:container`), passed as `-v` flags. `~/.claude`
+    /// and the working directory are always mounted.
+    #[serde(default)]
+    pub mounts: Option<Vec<String>>,
+
+    // ---- Shell runtime: declared lifecycle steps (unset ⇒ minimal default) ----
+    /// Steps to provision the workspace. Default: `mkdir -p {workdir}`.
     #[serde(default)]
     pub setup: Option<Vec<String>>,
-    /// Step to start the (detached) runtime. Default: tmux new-session.
+    /// Step to background the runtime (required for the shell runtime).
     #[serde(default)]
     pub launch: Option<String>,
-    /// Liveness check — exit 0 means running. Default: tmux has-session.
+    /// Liveness check — exit 0 means running.
     #[serde(default)]
     pub status: Option<String>,
-    /// Interactive attach. Default: tmux attach.
+    /// Interactive attach command.
     #[serde(default)]
     pub attach: Option<String>,
-    /// Steps to stop the runtime and deprovision. Default: kill tmux, forget
-    /// jj workspace, remove dir. Resolved at start and stored in the session's
-    /// state file, so `stop` is self-contained.
+    /// Steps to stop the runtime and deprovision. Default: `rm -rf {workdir}`.
     #[serde(default)]
     pub teardown: Option<Vec<String>>,
 
@@ -108,12 +146,14 @@ pub struct Recipe {
 }
 
 /// A fully-resolved instantiation plan: every template variable substituted,
-/// ready to execute. Produced by [`Recipe::plan`].
+/// ready to execute. Produced by [`Recipe::plan`]. `launch`/`status`/`attach`
+/// are empty strings when the recipe doesn't declare them.
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub session_name: String,
     pub workdir: PathBuf,
     pub command: String,
+    pub runtime: Runtime,
     pub setup: Vec<String>,
     pub launch: String,
     pub status: String,
@@ -204,16 +244,25 @@ impl Recipe {
         vars.insert("workdir", workdir.clone());
         vars.insert("command", command.clone());
 
-        let setup = subst_list(self.setup.as_deref(), DEFAULT_SETUP, &vars)?;
-        let launch = subst(self.launch.as_deref().unwrap_or(DEFAULT_LAUNCH), &vars)?;
-        let status = subst(self.status.as_deref().unwrap_or(DEFAULT_STATUS), &vars)?;
-        let attach = subst(self.attach.as_deref().unwrap_or(DEFAULT_ATTACH), &vars)?;
-        let teardown = subst_list(self.teardown.as_deref(), DEFAULT_TEARDOWN, &vars)?;
+        let (setup, launch, status, attach, teardown) = match self.runtime {
+            Runtime::Foreground | Runtime::Shell => {
+                // The declarative engine: the recipe's steps, or minimal defaults.
+                (
+                    subst_list(self.setup.as_deref(), DEFAULT_SETUP, &vars)?,
+                    subst_opt(self.launch.as_deref(), &vars)?,
+                    subst_opt(self.status.as_deref(), &vars)?,
+                    subst_opt(self.attach.as_deref(), &vars)?,
+                    subst_list(self.teardown.as_deref(), DEFAULT_TEARDOWN, &vars)?,
+                )
+            }
+            Runtime::Container => self.container_steps(&session_name, &workdir, &command, &vars)?,
+        };
 
         Ok(Plan {
             session_name,
             workdir: PathBuf::from(workdir),
             command,
+            runtime: self.runtime,
             setup,
             launch,
             status,
@@ -221,6 +270,92 @@ impl Recipe {
             teardown,
         })
     }
+
+    /// Build the built-in container lifecycle: a detached container with
+    /// `~/.claude` and the working directory mounted, running the command under
+    /// tmux (for interactive attach). Returns
+    /// `(setup, launch, status, attach, teardown)`.
+    fn container_steps(
+        &self,
+        session: &str,
+        workdir: &str,
+        command: &str,
+        vars: &HashMap<&str, String>,
+    ) -> Result<(Vec<String>, String, String, String, Vec<String>)> {
+        let engine = container_engine().ok_or_else(|| {
+            anyhow!(
+                "no container engine found — install docker or podman, \
+                 or set AGENTRY_CONTAINER_ENGINE (or use runtime = \"foreground\")"
+            )
+        })?;
+        let image = self.image.as_deref().unwrap_or(DEFAULT_IMAGE);
+        let claude_home = claude_home()?;
+
+        // Always mount the caller's claude auth + the working directory.
+        let mut mount_flags = format!(
+            "-v {}:/root/.claude -v {}:/work",
+            claude_home.display(),
+            workdir
+        );
+        if let Some(extra) = &self.mounts {
+            for m in extra {
+                mount_flags.push_str(&format!(" -v {}", subst(m, vars)?));
+            }
+        }
+
+        // Provision the host working directory (mounted at /work) and start a
+        // long-lived container. Its PID 1 is `sleep infinity` so it stays up
+        // independent of the agent; tmux + the agent are started via `exec`.
+        let mut setup = vec![format!("mkdir -p {}", workdir)];
+        if let Some(cm) = vars.get("claude_md") {
+            setup.push(format!("cp {} {}/CLAUDE.md", cm, workdir));
+        }
+        setup.push(format!(
+            "{engine} run -d --name {session} -e TERM=xterm-256color {mount_flags} -w /work \
+             {image} sleep infinity"
+        ));
+
+        // Start the agent under tmux inside the container (attachable via exec).
+        let launch = format!("{engine} exec -d {session} tmux new-session -d -s agent {command}");
+        // Liveness = the agent's tmux session is alive (fails if the container
+        // is gone or the agent has exited).
+        let status = format!("{engine} exec {session} tmux has-session -t agent");
+        let attach = format!("{engine} exec -it {session} tmux attach -t agent");
+        let teardown = vec![format!("{engine} rm -f {session}")];
+
+        Ok((setup, launch, status, attach, teardown))
+    }
+}
+
+/// The container engine to use: `$AGENTRY_CONTAINER_ENGINE`, else the first of
+/// `docker`/`podman` found on PATH.
+pub fn container_engine() -> Option<String> {
+    if let Some(e) = std::env::var_os("AGENTRY_CONTAINER_ENGINE") {
+        let e = e.to_string_lossy().into_owned();
+        return if e.is_empty() { None } else { Some(e) };
+    }
+    ["docker", "podman"]
+        .into_iter()
+        .find(|e| on_path(e))
+        .map(|e| e.to_string())
+}
+
+/// The caller's `~/.claude` directory (bind-mounted for container auth).
+fn claude_home() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
+    Ok(PathBuf::from(home).join(".claude"))
+}
+
+/// Whether a command is resolvable on PATH.
+pub fn on_path(cmd: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {}", cmd))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Substitute `{var}` placeholders from `vars`. Known variable names that are
@@ -240,6 +375,14 @@ fn subst(tpl: &str, vars: &HashMap<&str, String>) -> Result<String> {
         }
     }
     Ok(s)
+}
+
+/// Resolve an optional single template, or the empty string if unset.
+fn subst_opt(tpl: Option<&str>, vars: &HashMap<&str, String>) -> Result<String> {
+    match tpl {
+        Some(t) => subst(t, vars),
+        None => Ok(String::new()),
+    }
 }
 
 /// Resolve a list of steps: the recipe's own list if present, else the default.

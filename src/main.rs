@@ -23,6 +23,12 @@ enum Cmd {
         force: bool,
     },
 
+    /// Manage the agent container image.
+    Image {
+        #[command(subcommand)]
+        cmd: ImageCmd,
+    },
+
     /// Manage recipes (agent identity templates).
     Recipes {
         #[command(subcommand)]
@@ -66,6 +72,12 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ImageCmd {
+    /// Build the default agent image (agentry-agent:latest) from the bundled Dockerfile.
+    Build,
+}
+
+#[derive(Subcommand)]
 enum RecipesCmd {
     /// List recipes found in the search path.
     List,
@@ -77,9 +89,20 @@ enum RecipesCmd {
 }
 
 fn main() -> Result<()> {
+    // Behave like a normal Unix tool when stdout is closed early (e.g.
+    // `agentry list | head`): die on SIGPIPE instead of panicking. Rust sets
+    // SIGPIPE to SIG_IGN by default, which turns broken pipes into panics.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Init { force } => cmd::init(force),
+        Cmd::Image { cmd } => match cmd {
+            ImageCmd::Build => cmd::image_build(),
+        },
         Cmd::Recipes { cmd } => match cmd {
             RecipesCmd::List => cmd::recipes_list(),
             RecipesCmd::Show { recipe } => cmd::recipes_show(&recipe),

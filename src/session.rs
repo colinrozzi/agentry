@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -118,8 +118,14 @@ pub fn now_rfc3339() -> Result<String> {
     now.format(&Rfc3339).context("formatting timestamp")
 }
 
-/// Root under which per-session working directories are created.
+/// Root under which per-session working directories are created. Override with
+/// the `AGENTRY_SESSIONS` env var; otherwise defaults to the XDG data dir
+/// (`~/.local/share/agentry/sessions` on Linux).
 pub fn sessions_root() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
-    Ok(Path::new(&home).join("work/agentry-sessions"))
+    if let Some(v) = std::env::var_os("AGENTRY_SESSIONS") {
+        return Ok(PathBuf::from(v));
+    }
+    let dirs = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow::anyhow!("could not determine base dirs"))?;
+    Ok(dirs.data_dir().join("agentry/sessions"))
 }

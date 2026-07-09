@@ -6,7 +6,7 @@ resolver = "2"
 name = "agentry"
 version = "0.1.0"
 edition = "2021"
-description = "A CLI tool for managing local AI agent sessions: recipes, worktrees, and tmux-backed lifecycle."
+description = "A CLI tool for running local AI agent sessions from recipes, with a declarative lifecycle."
 repository = "https://github.com/colinrozzi/agentry"
 license = "MIT OR Apache-2.0"
 
@@ -21,6 +21,7 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 directories = "5"
+libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
 
