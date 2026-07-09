@@ -23,7 +23,9 @@ const AGENT_DOCKERFILE: &str = include_str!("assets/agent.Dockerfile");
 /// Dockerfile using the detected container engine.
 pub fn image_build() -> Result<()> {
     let engine = recipe::container_engine().ok_or_else(|| {
-        anyhow!("no container engine found — install docker or podman, or set AGENTRY_CONTAINER_ENGINE")
+        anyhow!(
+            "no container engine found — install docker or podman, or set AGENTRY_CONTAINER_ENGINE"
+        )
     })?;
     let dir = std::env::temp_dir().join(format!("agentry-image-build-{}", std::process::id()));
     std::fs::create_dir_all(&dir)
@@ -87,7 +89,9 @@ fn check_container_prereqs() {
         None => {
             println!("⚠  No container engine found (docker/podman).");
             println!("   agentry runs agents in containers by default — install docker or");
-            println!("   podman, or set AGENTRY_CONTAINER_ENGINE (or use runtime = \"foreground\").");
+            println!(
+                "   podman, or set AGENTRY_CONTAINER_ENGINE (or use runtime = \"foreground\")."
+            );
             println!();
             return;
         }
@@ -383,7 +387,10 @@ pub fn recipes_show(reference: &str) -> Result<()> {
     if recipe.runtime == recipe::Runtime::Container {
         println!(
             "image:       {}",
-            recipe.image.as_deref().unwrap_or("agentry-agent:latest (default)")
+            recipe
+                .image
+                .as_deref()
+                .unwrap_or("agentry-agent:latest (default)")
         );
     } else {
         let overrides = recipe.overrides();

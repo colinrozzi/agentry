@@ -52,11 +52,12 @@ const KNOWN_VARS: &[&str] = &[
 ];
 
 /// How agentry runs a session's agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Runtime {
     /// Built-in: run the agent inside a container (docker/podman), isolated,
     /// with `~/.claude` and the working directory mounted in. Default.
+    #[default]
     Container,
     /// Run the agent in your terminal, tearing down on exit. Zero-dependency;
     /// not tracked by `list`/`attach`/`stop`.
@@ -64,12 +65,6 @@ pub enum Runtime {
     /// Run the recipe's own declared `setup`/`launch`/`status`/`attach`/
     /// `teardown` steps — the escape hatch for tmux, cloud runners, anything.
     Shell,
-}
-
-impl Default for Runtime {
-    fn default() -> Self {
-        Runtime::Container
-    }
 }
 
 impl Runtime {
@@ -144,6 +139,9 @@ pub struct Recipe {
     #[serde(skip)]
     pub source: PathBuf,
 }
+
+/// A resolved lifecycle: `(setup, launch, status, attach, teardown)`.
+type Steps = (Vec<String>, String, String, String, Vec<String>);
 
 /// A fully-resolved instantiation plan: every template variable substituted,
 /// ready to execute. Produced by [`Recipe::plan`]. `launch`/`status`/`attach`
@@ -255,7 +253,15 @@ impl Recipe {
                     subst_list(self.teardown.as_deref(), DEFAULT_TEARDOWN, &vars)?,
                 )
             }
-            Runtime::Container => self.container_steps(&session_name, &workdir, &command, &vars)?,
+            Runtime::Container => {
+                let engine = container_engine().ok_or_else(|| {
+                    anyhow!(
+                        "no container engine found — install docker or podman, \
+                         or set AGENTRY_CONTAINER_ENGINE (or use runtime = \"foreground\")"
+                    )
+                })?;
+                self.container_steps(&engine, &session_name, &workdir, &command, &vars)?
+            }
         };
 
         Ok(Plan {
@@ -277,17 +283,12 @@ impl Recipe {
     /// `(setup, launch, status, attach, teardown)`.
     fn container_steps(
         &self,
+        engine: &str,
         session: &str,
         workdir: &str,
         command: &str,
         vars: &HashMap<&str, String>,
-    ) -> Result<(Vec<String>, String, String, String, Vec<String>)> {
-        let engine = container_engine().ok_or_else(|| {
-            anyhow!(
-                "no container engine found — install docker or podman, \
-                 or set AGENTRY_CONTAINER_ENGINE (or use runtime = \"foreground\")"
-            )
-        })?;
+    ) -> Result<Steps> {
         let image = self.image.as_deref().unwrap_or(DEFAULT_IMAGE);
         let claude_home = claude_home()?;
 
@@ -462,4 +463,125 @@ pub fn search_path() -> Vec<PathBuf> {
         roots.push(dirs.config_dir().join("agentry/recipes"));
     }
     roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a recipe from TOML and give it a source with a parent directory,
+    /// so `plan()`/`claude_md_abs()` can resolve relative paths.
+    fn recipe(toml: &str) -> Recipe {
+        let mut r: Recipe = toml::from_str(toml).expect("recipe parses");
+        r.source = PathBuf::from("/tmp/recipes/x/recipe.toml");
+        r
+    }
+
+    fn vars(pairs: &[(&'static str, &str)]) -> HashMap<&'static str, String> {
+        pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
+    }
+
+    #[test]
+    fn subst_replaces_known_vars() {
+        let v = vars(&[("workdir", "/w"), ("session", "agent-ab")]);
+        assert_eq!(
+            subst("{workdir}/x -s {session}", &v).unwrap(),
+            "/w/x -s agent-ab"
+        );
+    }
+
+    #[test]
+    fn subst_leaves_unknown_braces_alone() {
+        // Shell constructs like ${HOME} and awk '{print}' must survive.
+        let v = vars(&[]);
+        assert_eq!(subst("echo ${HOME}", &v).unwrap(), "echo ${HOME}");
+        assert_eq!(subst("awk '{print}'", &v).unwrap(), "awk '{print}'");
+    }
+
+    #[test]
+    fn subst_errors_on_known_but_unset_var() {
+        // {repo} is a known variable; referenced but unset ⇒ hard error.
+        let err = subst("jj -R {repo} ...", &vars(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("{repo}"), "got: {err}");
+    }
+
+    #[test]
+    fn runtime_defaults_to_container() {
+        let r = recipe("name = \"x\"\nclaude_md_path = \"./C.md\"\n");
+        assert_eq!(r.runtime, Runtime::Container);
+    }
+
+    #[test]
+    fn foreground_plan_uses_defaults_and_no_launch() {
+        let r = recipe("name = \"x\"\nruntime = \"foreground\"\n");
+        let plan = r
+            .plan("uuid-1", "abcd1234", Path::new("/sessions"), None)
+            .unwrap();
+        assert_eq!(plan.runtime, Runtime::Foreground);
+        assert_eq!(plan.command, "claude");
+        assert_eq!(plan.workdir, PathBuf::from("/sessions/uuid-1"));
+        assert_eq!(plan.setup, vec!["mkdir -p /sessions/uuid-1"]);
+        assert_eq!(plan.teardown, vec!["rm -rf /sessions/uuid-1"]);
+        assert!(plan.launch.is_empty());
+    }
+
+    #[test]
+    fn shell_plan_substitutes_declared_steps() {
+        let r = recipe(
+            "name = \"x\"\nruntime = \"shell\"\n\
+             launch = \"tmux new-session -d -s {session} -c {workdir} {command}\"\n\
+             status = \"tmux has-session -t {session}\"\n",
+        );
+        let plan = r.plan("u", "abcd1234", Path::new("/s"), None).unwrap();
+        assert_eq!(
+            plan.launch,
+            "tmux new-session -d -s agent-abcd1234 -c /s/u claude"
+        );
+        assert_eq!(plan.status, "tmux has-session -t agent-abcd1234");
+    }
+
+    #[test]
+    fn container_steps_shape() {
+        let r = recipe("name = \"x\"\n");
+        let workdir = "/s/u";
+        let mut v = vars(&[("workdir", workdir), ("command", "claude")]);
+        v.insert("claude_md", "/tmp/recipes/x/C.md".into());
+        let (setup, launch, status, attach, teardown) = r
+            .container_steps("docker", "agent-abcd1234", workdir, "claude", &v)
+            .unwrap();
+
+        assert_eq!(setup[0], "mkdir -p /s/u");
+        assert!(setup
+            .iter()
+            .any(|s| s.contains("cp /tmp/recipes/x/C.md /s/u/CLAUDE.md")));
+        assert!(setup
+            .last()
+            .unwrap()
+            .contains("docker run -d --name agent-abcd1234"));
+        assert!(
+            launch.contains("docker exec -d agent-abcd1234 tmux new-session -d -s agent claude")
+        );
+        assert!(status.contains("docker exec agent-abcd1234 tmux has-session -t agent"));
+        assert!(attach.contains("docker exec -it agent-abcd1234 tmux attach -t agent"));
+        assert_eq!(teardown, vec!["docker rm -f agent-abcd1234"]);
+        // default image
+        assert!(setup.last().unwrap().contains("agentry-agent:latest"));
+    }
+
+    #[test]
+    fn container_steps_honor_custom_image_and_mounts() {
+        let r = recipe("name = \"x\"\nimage = \"my/img:1\"\nmounts = [\"/host:/c\"]\n");
+        let v = vars(&[("workdir", "/w"), ("command", "claude")]);
+        let (setup, _, _, _, _) = r
+            .container_steps("podman", "agent-z", "/w", "claude", &v)
+            .unwrap();
+        // image + extra mounts land in the `run` command (the last setup step).
+        let run = setup.last().unwrap();
+        assert!(run.starts_with("podman run -d"));
+        assert!(run.contains("my/img:1"));
+        assert!(run.contains("-v /host:/c"));
+        assert!(run.contains("-v /w:/work"));
+    }
 }
