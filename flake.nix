@@ -22,7 +22,15 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          # Keep Cargo/Rust sources *plus* the embedded assets under src/assets
+          # (recipe.toml, CLAUDE.md, Dockerfile) that `include_str!` needs.
+          # `cleanCargoSource` alone strips them and the release build fails.
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = path: type:
+              (craneLib.filterCargoSources path type)
+              || (builtins.match ".*/src/assets/.*" path != null);
+          };
           pname = "agentry";
           version = "0.1.0";
         };
