@@ -34,3 +34,18 @@ jobs:
 
       - name: build
         run: cargo build -p agentry --release
+
+  # The real release path is `nix build` (the flake, via crane). It filters the
+  # source, so a raw `cargo build` can pass while the release build is broken
+  # (e.g. missing embedded assets). Build the flake to catch that.
+  nix-build:
+    name: nix build (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: nix build
+        run: nix build -L
