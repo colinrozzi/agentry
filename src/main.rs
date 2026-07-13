@@ -3,7 +3,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod client;
 mod cmd;
+mod daemon;
+mod protocol;
 mod recipe;
 mod session;
 
@@ -16,6 +19,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run the agentry daemon (owns session state, serves the control socket).
+    Daemon,
+
     /// Seed the recipes directory with a starter onboarding-agent recipe.
     Init {
         /// Overwrite the onboarding-agent recipe if it already exists.
@@ -99,22 +105,25 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        // Local commands — no daemon needed.
+        Cmd::Daemon => daemon::serve(),
         Cmd::Init { force } => cmd::init(force),
         Cmd::Image { cmd } => match cmd {
             ImageCmd::Build => cmd::image_build(),
         },
+        // Everything stateful goes through the daemon via the client.
         Cmd::Recipes { cmd } => match cmd {
-            RecipesCmd::List => cmd::recipes_list(),
-            RecipesCmd::Show { recipe } => cmd::recipes_show(&recipe),
+            RecipesCmd::List => client::recipes_list(),
+            RecipesCmd::Show { recipe } => client::recipes_show(&recipe),
         },
         Cmd::Start {
             recipe,
             repo,
             r#for,
-        } => cmd::start(&recipe, repo.as_deref(), r#for.as_deref()),
-        Cmd::List => cmd::list(),
-        Cmd::Stop { name } => cmd::stop(&name),
-        Cmd::Show { name } => cmd::show(&name),
-        Cmd::Attach { name } => cmd::attach(&name),
+        } => client::start(&recipe, repo.as_deref(), r#for.as_deref()),
+        Cmd::List => client::list(),
+        Cmd::Stop { name } => client::stop(&name),
+        Cmd::Show { name } => client::show(&name),
+        Cmd::Attach { name } => client::attach(&name),
     }
 }

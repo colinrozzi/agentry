@@ -23,6 +23,7 @@ agent without a container, a recipe can set `runtime = "foreground"` (runs
 ```sh
 agentry init                         # seed your first recipe + preflight checks
 agentry image build                  # build the agent image (once; installs claude)
+agentry daemon &                     # start the daemon (owns state, serves the socket)
 agentry start onboarding-agent       # spawn it in a container
 agentry attach <name>                # attach and chat (name from `agentry list`)
 ```
@@ -30,9 +31,26 @@ agentry attach <name>                # attach and chat (name from `agentry list`
 The `onboarding-agent` is an interactive guide to the tool *and* a worked example
 of the recipe format — spawn it, attach, and it'll walk you through the rest.
 
+## The daemon
+
+agentry runs as a small **daemon** plus a thin **CLI client**. The daemon owns
+session state and serves a Unix **control socket**; every stateful command
+(`start`/`stop`/`list`/`show`/`attach`, `recipes …`) is a request to it. Start it
+with `agentry daemon` (foreground; background it with `&` or a service). Without
+it, those commands error with `no agentry daemon running — start one with
+agentry daemon`. Only `agentry daemon`, `agentry init`, and `agentry image build`
+run without the daemon.
+
+The socket is `$AGENTRY_SOCKET` (default `$XDG_RUNTIME_DIR/agentry/agentry.sock`,
+perms `0600`). That permission is the trust boundary — anyone who can write the
+socket can spawn/stop agents. See [docs/daemon.md](docs/daemon.md) for the design
+(and the planned control-socket mount that lets a containerized agent manage the
+fleet).
+
 ## Commands
 
 ```sh
+agentry daemon                       # run the daemon (owns state + control socket)
 agentry init [--force]               # seed the onboarding-agent recipe + preflight
 agentry image build                  # build the default agent image
 
