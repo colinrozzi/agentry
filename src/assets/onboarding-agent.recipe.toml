@@ -11,3 +11,7 @@ claude_md_path = "./CLAUDE.md"
 
 # runtime = "container" is the default. To run in your terminal instead with no
 # container, you'd set:  runtime = "foreground"
+
+# Mount the control socket so the guide can inspect and manage your real fleet
+# (agentry recipes list / agentry list / …) from inside its container.
+control_socket = true
