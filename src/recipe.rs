@@ -117,6 +117,11 @@ pub struct Recipe {
     /// and the working directory are always mounted.
     #[serde(default)]
     pub mounts: Option<Vec<String>>,
+    /// Mount the agentry control socket into the container (at `/run/agentry.sock`)
+    /// so the agent can manage the host fleet — `agentry list/start/stop/recipes`.
+    /// A trust grant: the agent gains full control of your fleet. Container only.
+    #[serde(default)]
+    pub control_socket: bool,
 
     // ---- Shell runtime: declared lifecycle steps (unset ⇒ minimal default) ----
     /// Steps to provision the workspace. Default: `mkdir -p {workdir}`.
@@ -302,6 +307,14 @@ impl Recipe {
             for m in extra {
                 mount_flags.push_str(&format!(" -v {}", subst(m, vars)?));
             }
+        }
+        // Mount the control socket so the agent can drive the host daemon.
+        if self.control_socket {
+            let sock = crate::protocol::socket_path();
+            mount_flags.push_str(&format!(
+                " -v {}:/run/agentry.sock -e AGENTRY_SOCKET=/run/agentry.sock",
+                sock.display()
+            ));
         }
 
         // Provision the host working directory (mounted at /work) and start a
@@ -583,5 +596,20 @@ mod tests {
         assert!(run.contains("my/img:1"));
         assert!(run.contains("-v /host:/c"));
         assert!(run.contains("-v /w:/work"));
+    }
+
+    #[test]
+    fn container_steps_mount_control_socket() {
+        let r = recipe("name = \"x\"\ncontrol_socket = true\n");
+        let v = vars(&[("workdir", "/w"), ("command", "claude")]);
+        let (setup, _, _, _, _) = r
+            .container_steps("podman", "agent-z", "/w", "claude", &v)
+            .unwrap();
+        let run = setup.last().unwrap();
+        assert!(run.contains(":/run/agentry.sock"), "run: {run}");
+        assert!(
+            run.contains("-e AGENTRY_SOCKET=/run/agentry.sock"),
+            "run: {run}"
+        );
     }
 }

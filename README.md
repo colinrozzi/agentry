@@ -43,9 +43,19 @@ run without the daemon.
 
 The socket is `$AGENTRY_SOCKET` (default `$XDG_RUNTIME_DIR/agentry/agentry.sock`,
 perms `0600`). That permission is the trust boundary — anyone who can write the
-socket can spawn/stop agents. See [docs/daemon.md](docs/daemon.md) for the design
-(and the planned control-socket mount that lets a containerized agent manage the
-fleet).
+socket can spawn/stop agents. See [docs/daemon.md](docs/daemon.md) for the design.
+
+### Giving an agent control of the fleet
+
+A container recipe can set **`control_socket = true`** to mount the host control
+socket into the container (at `/run/agentry.sock`). The agent image ships the
+`agentry` binary, so the agent can then run `agentry list` / `agentry start` /
+`agentry recipes list` against the *host* fleet — from inside its sandbox, with
+no host filesystem or docker-socket access. The seeded `onboarding-agent` uses
+this, so the guide can show you your real setup.
+
+This is a **trust grant**: an agent with the socket can spawn and stop any of
+your agents (which run arbitrary shell). Only enable it for agents you trust.
 
 ## Commands
 
