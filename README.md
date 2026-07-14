@@ -55,7 +55,10 @@ no host filesystem or docker-socket access. The seeded `onboarding-agent` uses
 this, so the guide can show you your real setup.
 
 This is a **trust grant**: an agent with the socket can spawn and stop any of
-your agents (which run arbitrary shell). Only enable it for agents you trust.
+your agents (which run arbitrary shell) and create/delete recipes. Only enable it
+for agents you trust. A socket agent can `agentry recipes write` to author a new
+recipe on the host — so the onboarding guide can help you *build* a recipe, then
+`agentry start` it, all from inside its container.
 
 ## Commands
 
@@ -65,7 +68,9 @@ agentry init [--force]               # seed the onboarding-agent recipe + prefli
 agentry image build                  # build the default agent image
 
 agentry recipes list                 # enumerate recipes in the search path
-agentry recipes show <name|path>     # show one recipe's metadata + runtime
+agentry recipes show <name|path> [--raw]   # metadata (or the raw recipe.toml)
+agentry recipes write <name> --from <dir>  # create/update a recipe (recipe.toml [+ CLAUDE.md])
+agentry recipes rm <name>            # delete a recipe
 
 agentry start <recipe> [--repo <p>] [--for <ticket>]
 agentry list                         # tracked sessions + their liveness

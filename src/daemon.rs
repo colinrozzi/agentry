@@ -67,6 +67,8 @@ fn dispatch(req: Request) -> Response {
     match req.op.as_str() {
         "recipes.list" => respond(handle_recipes_list()),
         "recipes.show" => respond(handle_recipes_show(&req.args)),
+        "recipes.write" => respond(handle_recipes_write(&req.args)),
+        "recipes.delete" => respond(handle_recipes_delete(&req.args)),
         "session.list" => respond(handle_session_list()),
         "session.show" => respond(handle_session_show(&req.args)),
         "session.start" => respond(handle_session_start(&req.args)),
@@ -102,6 +104,9 @@ fn handle_recipes_list() -> Result<Value> {
 
 fn handle_recipes_show(args: &Value) -> Result<Value> {
     let r = recipe::resolve(arg_str(args, "recipe")?)?;
+    // Raw file contents too, so a client (e.g. a container agent) can edit them.
+    let recipe_toml = fs::read_to_string(&r.source).unwrap_or_default();
+    let claude_md_content = r.claude_md_abs().and_then(|p| fs::read_to_string(p).ok());
     Ok(json!({
         "name": r.name,
         "description": r.description,
@@ -111,7 +116,48 @@ fn handle_recipes_show(args: &Value) -> Result<Value> {
         "runtime": r.runtime.as_str(),
         "image": r.image,
         "overrides": r.overrides(),
+        "recipe_toml": recipe_toml,
+        "claude_md_content": claude_md_content,
     }))
+}
+
+/// Create or update a recipe under the primary search-path directory. The TOML
+/// is validated (must parse as a recipe) before anything is written.
+fn handle_recipes_write(args: &Value) -> Result<Value> {
+    let name = arg_str(args, "name")?;
+    if name.is_empty() || name.contains('/') {
+        bail!("invalid recipe name '{name}'");
+    }
+    let recipe_toml = arg_str(args, "recipe_toml")?;
+    toml::from_str::<recipe::Recipe>(recipe_toml)
+        .map_err(|e| anyhow!("recipe does not parse: {e}"))?;
+
+    let root = recipe::search_path()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("could not determine a recipes directory"))?;
+    let dir = root.join(name);
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("recipe.toml"), recipe_toml)?;
+    if let Some(cm) = args.get("claude_md").and_then(|v| v.as_str()) {
+        fs::write(dir.join("CLAUDE.md"), cm)?;
+    }
+    Ok(json!({ "name": name, "path": dir.join("recipe.toml") }))
+}
+
+/// Delete a named recipe (its directory) from the search path.
+fn handle_recipes_delete(args: &Value) -> Result<Value> {
+    let name = arg_str(args, "name")?;
+    if name.is_empty() || name.contains('/') {
+        bail!("invalid recipe name '{name}'");
+    }
+    let dir = recipe::search_path()
+        .into_iter()
+        .map(|root| root.join(name))
+        .find(|d| d.join("recipe.toml").exists())
+        .ok_or_else(|| anyhow!("recipe '{name}' not found"))?;
+    fs::remove_dir_all(&dir)?;
+    Ok(json!({ "name": name }))
 }
 
 fn handle_session_list() -> Result<Value> {
