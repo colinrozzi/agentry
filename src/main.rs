@@ -91,6 +91,22 @@ enum RecipesCmd {
     Show {
         /// Recipe name or path to recipe.toml.
         recipe: String,
+        /// Print the raw recipe.toml instead of formatted metadata.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Create or update a recipe from a directory (recipe.toml [+ CLAUDE.md]).
+    Write {
+        /// Recipe name (the directory it's written under).
+        name: String,
+        /// Directory containing recipe.toml (and optionally CLAUDE.md).
+        #[arg(long)]
+        from: String,
+    },
+    /// Delete a recipe by name.
+    Rm {
+        /// Recipe name.
+        name: String,
     },
 }
 
@@ -114,7 +130,11 @@ fn main() -> Result<()> {
         // Everything stateful goes through the daemon via the client.
         Cmd::Recipes { cmd } => match cmd {
             RecipesCmd::List => client::recipes_list(),
-            RecipesCmd::Show { recipe } => client::recipes_show(&recipe),
+            RecipesCmd::Show { recipe, raw } => client::recipes_show(&recipe, raw),
+            RecipesCmd::Write { name, from } => {
+                client::recipes_write(&name, std::path::Path::new(&from))
+            }
+            RecipesCmd::Rm { name } => client::recipes_delete(&name),
         },
         Cmd::Start {
             recipe,

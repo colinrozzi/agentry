@@ -1,10 +1,11 @@
 //! CLI client: turns `agentry <verb>` into a request to the daemon, then
 //! renders the response. Requires a running daemon (`agentry daemon`).
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::Command;
 
 use crate::protocol::{ForegroundPlan, Request, Response, SessionView, PROTOCOL_VERSION};
@@ -66,8 +67,13 @@ pub fn recipes_list() -> Result<()> {
     Ok(())
 }
 
-pub fn recipes_show(reference: &str) -> Result<()> {
+pub fn recipes_show(reference: &str, raw: bool) -> Result<()> {
     let d = request("recipes.show", json!({ "recipe": reference }))?;
+    if raw {
+        // Print the raw recipe.toml so a client can edit and re-`write` it.
+        print!("{}", d["recipe_toml"].as_str().unwrap_or(""));
+        return Ok(());
+    }
     let s = |v: &Value| v.as_str().unwrap_or("").to_string();
     println!("name:        {}", s(&d["name"]));
     println!("description: {}", s(&d["description"]));
@@ -101,6 +107,34 @@ pub fn recipes_show(reference: &str) -> Result<()> {
             }
         );
     }
+    Ok(())
+}
+
+/// Create or update a recipe on the host from a directory containing
+/// `recipe.toml` (and optionally `CLAUDE.md`).
+pub fn recipes_write(name: &str, from: &Path) -> Result<()> {
+    let recipe_toml = std::fs::read_to_string(from.join("recipe.toml"))
+        .with_context(|| format!("reading {}/recipe.toml", from.display()))?;
+    let mut args = json!({ "name": name, "recipe_toml": recipe_toml });
+    let cm = from.join("CLAUDE.md");
+    if cm.exists() {
+        args["claude_md"] =
+            json!(std::fs::read_to_string(&cm)
+                .with_context(|| format!("reading {}", cm.display()))?);
+    }
+    let d = request("recipes.write", args)?;
+    println!(
+        "wrote recipe '{}' to {}",
+        name,
+        d["path"].as_str().unwrap_or("?")
+    );
+    Ok(())
+}
+
+/// Delete a recipe from the host by name.
+pub fn recipes_delete(name: &str) -> Result<()> {
+    request("recipes.delete", json!({ "name": name }))?;
+    println!("removed recipe '{}'", name);
     Ok(())
 }
 
