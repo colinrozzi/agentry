@@ -104,6 +104,12 @@ pub struct Recipe {
     /// Command run inside the session. Default `claude`.
     #[serde(default)]
     pub command: Option<String>,
+    /// An opening message sent to the agent on the user's behalf at launch,
+    /// passed as `claude`'s first prompt. The agent starts the conversation
+    /// instead of the user attaching to a blank prompt. Templated like other
+    /// fields. Optional.
+    #[serde(default)]
+    pub message: Option<String>,
     /// The session's working directory (mounted into the container for the
     /// container runtime). Default `{sessions_root}/{uuid}`.
     #[serde(default)]
@@ -241,6 +247,17 @@ impl Recipe {
 
         let command = subst(self.command.as_deref().unwrap_or(DEFAULT_COMMAND), &base)?;
         let workdir = subst(self.workdir.as_deref().unwrap_or(DEFAULT_WORKDIR), &base)?;
+
+        // Seed an opening message as the agent's first prompt, if the recipe
+        // declares one: `claude` takes a positional prompt and stays
+        // interactive. Shell-quoted so it survives as a single argument through
+        // `sh -c` (and tmux, for the container runtime) intact.
+        let command = match self.message.as_deref() {
+            Some(m) if !m.is_empty() => {
+                format!("{} {}", command, shell_quote(&subst(m, &base)?))
+            }
+            _ => command,
+        };
 
         // Phase 2: full context, now including workdir + command.
         let mut vars = base;
@@ -389,6 +406,12 @@ fn claude_json_host() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default()
         .join(".claude.json")
+}
+
+/// POSIX single-quote a string so it survives `sh -c` parsing as one argument.
+/// Wraps in `'…'` and rewrites any embedded `'` as `'\''`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Whether a command is resolvable on PATH.
@@ -584,6 +607,22 @@ mod tests {
             "tmux new-session -d -s agent-abcd1234 -c /s/u claude"
         );
         assert_eq!(plan.status, "tmux has-session -t agent-abcd1234");
+    }
+
+    #[test]
+    fn message_is_appended_as_quoted_first_prompt() {
+        // Foreground so we can read the resolved command directly.
+        let r = recipe("name = \"x\"\nruntime = \"foreground\"\nmessage = \"hi there\"\n");
+        let plan = r.plan("u", "abcd1234", Path::new("/s"), None).unwrap();
+        assert_eq!(plan.command, "claude 'hi there'");
+    }
+
+    #[test]
+    fn message_with_apostrophe_is_escaped() {
+        let r = recipe("name = \"x\"\nruntime = \"foreground\"\nmessage = \"don't panic\"\n");
+        let plan = r.plan("u", "abcd1234", Path::new("/s"), None).unwrap();
+        // Single argument preserved: '…' with the embedded ' as '\''.
+        assert_eq!(plan.command, "claude 'don'\\''t panic'");
     }
 
     #[test]
