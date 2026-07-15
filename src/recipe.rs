@@ -329,6 +329,26 @@ impl Recipe {
              {image} sleep infinity"
         ));
 
+        // Carry the caller's Claude config (~/.claude.json: onboarding state +
+        // account) into the container so the agent doesn't re-run onboarding —
+        // the mounted ~/.claude only holds the token, not this. Copied, not
+        // mounted, so each container is isolated and never writes back to the
+        // host file; best-effort (skipped if the caller has no ~/.claude.json).
+        let claude_json = claude_json_host();
+        setup.push(format!(
+            "[ -f {json} ] && {engine} cp {json} {session}:/root/.claude.json || true",
+            json = claude_json.display()
+        ));
+        // Trust the working directory so the agent skips the "trust this folder?"
+        // prompt: patch ~/.claude.json in-container via the image's baked jq
+        // program. A no-op if jq is absent (older image), so spawn never breaks.
+        setup.push(format!(
+            "{engine} exec {session} sh -c 'command -v jq >/dev/null 2>&1 || exit 0; \
+             [ -f \"$HOME/.claude.json\" ] || printf \"{{}}\" > \"$HOME/.claude.json\"; \
+             jq -f /etc/agentry-trust.jq \"$HOME/.claude.json\" > \"$HOME/.claude.json.tmp\" \
+             && mv \"$HOME/.claude.json.tmp\" \"$HOME/.claude.json\"'"
+        ));
+
         // Start the agent under tmux inside the container (attachable via exec).
         let launch = format!("{engine} exec -d {session} tmux new-session -d -s agent {command}");
         // Liveness = the agent's tmux session is alive (fails if the container
@@ -358,6 +378,17 @@ pub fn container_engine() -> Option<String> {
 fn claude_home() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
     Ok(PathBuf::from(home).join(".claude"))
+}
+
+/// The caller's `~/.claude.json` (Claude Code's user config: onboarding state +
+/// account). Copied into the container so the agent inherits completed
+/// onboarding. Infallible: if `HOME` is unset the path simply won't exist and
+/// the copy step (guarded by `[ -f … ]`) is skipped.
+fn claude_json_host() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".claude.json")
 }
 
 /// Whether a command is resolvable on PATH.
@@ -569,10 +600,8 @@ mod tests {
         assert!(setup
             .iter()
             .any(|s| s.contains("cp /tmp/recipes/x/C.md /s/u/CLAUDE.md")));
-        assert!(setup
-            .last()
-            .unwrap()
-            .contains("docker run -d --name agent-abcd1234"));
+        let run = setup.iter().find(|s| s.contains("run -d")).unwrap();
+        assert!(run.contains("docker run -d --name agent-abcd1234"));
         assert!(
             launch.contains("docker exec -d agent-abcd1234 tmux new-session -d -s agent claude")
         );
@@ -580,7 +609,10 @@ mod tests {
         assert!(attach.contains("docker exec -it agent-abcd1234 tmux attach -t agent"));
         assert_eq!(teardown, vec!["docker rm -f agent-abcd1234"]);
         // default image
-        assert!(setup.last().unwrap().contains("agentry-agent:latest"));
+        assert!(run.contains("agentry-agent:latest"));
+        // caller's onboarding config is copied in, and /work is trusted
+        assert!(setup.iter().any(|s| s.contains(":/root/.claude.json")));
+        assert!(setup.iter().any(|s| s.contains("agentry-trust.jq")));
     }
 
     #[test]
@@ -591,7 +623,7 @@ mod tests {
             .container_steps("podman", "agent-z", "/w", "claude", &v)
             .unwrap();
         // image + extra mounts land in the `run` command (the last setup step).
-        let run = setup.last().unwrap();
+        let run = setup.iter().find(|s| s.contains("run -d")).unwrap();
         assert!(run.starts_with("podman run -d"));
         assert!(run.contains("my/img:1"));
         assert!(run.contains("-v /host:/c"));
@@ -605,7 +637,7 @@ mod tests {
         let (setup, _, _, _, _) = r
             .container_steps("podman", "agent-z", "/w", "claude", &v)
             .unwrap();
-        let run = setup.last().unwrap();
+        let run = setup.iter().find(|s| s.contains("run -d")).unwrap();
         assert!(run.contains(":/run/agentry.sock"), "run: {run}");
         assert!(
             run.contains("-e AGENTRY_SOCKET=/run/agentry.sock"),

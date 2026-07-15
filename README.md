@@ -108,9 +108,11 @@ The directory containing `recipe.toml` is purely organizational; the tool only c
 A recipe's `runtime` decides how the agent runs:
 
 - **`container`** (default) — agentry runs the agent in a container (docker/podman),
-  isolated, with your `~/.claude` and the working directory mounted in. Configure
-  it with `image` (default `agentry-agent:latest`) and extra `mounts`. Tracked by
-  `list`/`attach`/`stop`.
+  isolated, with your `~/.claude` (auth) and the working directory mounted in. Your
+  `~/.claude.json` (onboarding state + account) is copied in too, and the working
+  directory is pre-trusted — so the agent starts straight in Claude, no onboarding
+  or "trust this folder?" prompts. Configure it with `image` (default
+  `agentry-agent:latest`) and extra `mounts`. Tracked by `list`/`attach`/`stop`.
 - **`foreground`** — runs `command` (default `claude`) in your terminal, in a
   fresh working directory, tearing down on exit. Zero dependencies; not tracked.
 - **`shell`** — you declare the whole lifecycle as shell steps (below). The escape
