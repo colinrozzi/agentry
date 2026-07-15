@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         tmux \
+        jq \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,6 +25,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/root/.local/bin:${PATH}"
 RUN claude --version
+
+# The install writes a stub ~/.claude.json (a build-time machine/user id, but no
+# `hasCompletedOnboarding`). Leaving it would force onboarding at spawn even
+# though the mounted token is valid — so drop it. At spawn agentry copies the
+# caller's real ~/.claude.json in (see src/recipe.rs::container_steps).
+RUN rm -f /root/.claude.json
+
+# jq program agentry runs at spawn to trust the working directory (/work), so the
+# agent skips the "trust this folder?" prompt.
+RUN printf '%s\n' '(.projects //= {}) | .projects["/work"].hasTrustDialogAccepted = true' \
+        > /etc/agentry-trust.jq
 
 # The agentry client, for agents that get the control socket.
 COPY --from=build /usr/local/bin/agentry /usr/local/bin/agentry
