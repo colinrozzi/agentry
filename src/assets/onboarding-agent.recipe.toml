@@ -15,3 +15,13 @@ claude_md_path = "./CLAUDE.md"
 # Mount the control socket so the guide can inspect and manage your real fleet
 # (agentry recipes list / agentry list / …) from inside its container.
 control_socket = true
+
+# Kick off the conversation on the user's behalf — passed as claude's first
+# prompt, so attaching drops you into an introduction rather than a blank screen.
+message = """
+Hi! I just ran `agentry start onboarding-agent` and attached — I'm new to \
+agentry. Please introduce yourself, explain what agentry is and what you can \
+help me do, then give me a quick tour of my actual setup: run `agentry recipes \
+list` and `agentry list` (you have my control socket) and walk me through what \
+you find. Keep it friendly and concise.\
+"""
