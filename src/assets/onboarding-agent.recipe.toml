@@ -1,27 +1,28 @@
-# The onboarding-agent recipe, seeded by `agentry init`.
+# onboarding-agent — the recipe agentry seeds on `agentry init`.
 #
-# The simplest possible recipe: just an identity and a brief. It uses the
-# default `container` runtime, so `agentry start onboarding-agent` runs `claude`
-# in a container (with your ~/.claude and a scratch working directory mounted
-# in) — nothing else to declare. It doubles as the minimal recipe example.
+# A `container` recipe is metadata plus a launch script. agentry runs launch.sh
+# on `agentry start` (it does the podman run, mounts your Claude credentials in,
+# trusts the workspace, and starts the agent), then owns the generic verbs:
+#   agentry attach <name>   ->  podman attach agent-<id>
+#   agentry list            ->  is the container running?
+#   agentry stop <name>     ->  podman rm -f agent-<id>
+# To run a different image, mount other things, or use a different harness, edit
+# launch.sh — nothing here is baked into agentry.
 
 name = "onboarding-agent"
 description = "Meet agentry — an interactive guide to recipes, sessions, and the lifecycle"
 claude_md_path = "./CLAUDE.md"
+runtime = "container"
 
-# runtime = "container" is the default. To run in your terminal instead with no
-# container, you'd set:  runtime = "foreground"
-
-# Mount the control socket so the guide can inspect and manage your real fleet
-# (agentry recipes list / agentry list / …) from inside its container.
-control_socket = true
-
-# Kick off the conversation on the user's behalf — passed as claude's first
-# prompt, so attaching drops you into an introduction rather than a blank screen.
+# The opening line, sent on your behalf as the agent's first prompt (launch.sh
+# passes it to claude), so attaching drops you into an introduction.
 message = """
 Hi! I just ran `agentry start onboarding-agent` and attached — I'm new to \
 agentry. Please introduce yourself, explain what agentry is and what you can \
-help me do, then give me a quick tour of my actual setup: run `agentry recipes \
-list` and `agentry list` (you have my control socket) and walk me through what \
-you find. Keep it friendly and concise.\
+help me do, then give me a quick tour of my setup: run `agentry recipes list` \
+and `agentry list` (you have my control socket) and walk me through it. \
+Friendly and concise, please.\
 """
+
+# No launch/status/attach/teardown here: `container` supplies them. launch
+# defaults to `sh {recipe_dir}/launch.sh`; override any verb if you need to.

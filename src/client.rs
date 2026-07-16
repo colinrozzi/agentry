@@ -89,23 +89,11 @@ pub fn recipes_show(reference: &str, raw: bool) -> Result<()> {
         d["claude_md"].as_str().unwrap_or("(none)")
     );
     println!("runtime:     {}", s(&d["runtime"]));
-    if d["runtime"] == "container" {
-        println!(
-            "image:       {}",
-            d["image"]
-                .as_str()
-                .unwrap_or("agentry-agent:latest (default)")
-        );
-    } else if let Some(ov) = d["overrides"].as_array() {
+    if let Some(ov) = d["overrides"].as_array() {
         let names: Vec<&str> = ov.iter().filter_map(|v| v.as_str()).collect();
-        println!(
-            "lifecycle:   {}",
-            if names.is_empty() {
-                "default".to_string()
-            } else {
-                format!("custom: {}", names.join(", "))
-            }
-        );
+        if !names.is_empty() {
+            println!("lifecycle:   custom: {}", names.join(", "));
+        }
     }
     Ok(())
 }
@@ -290,5 +278,10 @@ pub fn start(recipe: &str, repo: Option<&str>, ticket: Option<&str>) -> Result<(
         println!("  session:  {}", sess);
     }
     println!("\nattach with:  agentry attach {}", name);
+    if d["runtime"].as_str() == Some("container") {
+        if let Some(sess) = d["session"].as_str() {
+            println!("         or:  podman attach {}", sess);
+        }
+    }
     Ok(())
 }

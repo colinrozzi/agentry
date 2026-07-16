@@ -10,6 +10,7 @@ use crate::recipe;
 /// The starter recipe seeded by `agentry init`, embedded at build time.
 const ONBOARDING_RECIPE_TOML: &str = include_str!("assets/onboarding-agent.recipe.toml");
 const ONBOARDING_CLAUDE_MD: &str = include_str!("assets/onboarding-agent.CLAUDE.md");
+const ONBOARDING_LAUNCH_SH: &str = include_str!("assets/onboarding-agent.launch.sh");
 /// The default agent image's Dockerfile, embedded at build time.
 const AGENT_DOCKERFILE: &str = include_str!("assets/agent.Dockerfile");
 
@@ -51,6 +52,7 @@ pub fn init(force: bool) -> Result<()> {
     let dir = recipes_root.join("onboarding-agent");
     let recipe_toml = dir.join("recipe.toml");
     let claude_md = dir.join("CLAUDE.md");
+    let launch_sh = dir.join("launch.sh");
 
     if recipe_toml.exists() && !force {
         println!(
@@ -65,8 +67,11 @@ pub fn init(force: bool) -> Result<()> {
             .with_context(|| format!("writing {}", recipe_toml.display()))?;
         std::fs::write(&claude_md, ONBOARDING_CLAUDE_MD)
             .with_context(|| format!("writing {}", claude_md.display()))?;
+        std::fs::write(&launch_sh, ONBOARDING_LAUNCH_SH)
+            .with_context(|| format!("writing {}", launch_sh.display()))?;
         println!("seeded onboarding-agent recipe at {}", dir.display());
         println!("  recipe: {}", recipe_toml.display());
+        println!("  launch: {}", launch_sh.display());
         println!("  guide:  {}", claude_md.display());
     }
     println!();
@@ -75,17 +80,15 @@ pub fn init(force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Agents run in containers by default, so warn early (at `init`) if the
-/// container engine or the agent image isn't ready.
+/// The onboarding-agent runs in a container, so warn early (at `init`) if podman
+/// or the agent image isn't ready.
 fn check_container_prereqs() {
     let engine = match recipe::container_engine() {
         Some(e) => e,
         None => {
-            println!("⚠  No container engine found (docker/podman).");
-            println!("   agentry runs agents in containers by default — install docker or");
-            println!(
-                "   podman, or set AGENTRY_CONTAINER_ENGINE (or use runtime = \"foreground\")."
-            );
+            println!("⚠  podman not found.");
+            println!("   The onboarding-agent runs in a container — install podman (or edit");
+            println!("   its launch.sh / use a `foreground` recipe to run claude directly).");
             println!();
             return;
         }

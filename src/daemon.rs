@@ -114,7 +114,6 @@ fn handle_recipes_show(args: &Value) -> Result<Value> {
         "source": r.source,
         "claude_md": r.claude_md_abs(),
         "runtime": r.runtime.as_str(),
-        "image": r.image,
         "overrides": r.overrides(),
         "recipe_toml": recipe_toml,
         "claude_md_content": claude_md_content,
@@ -213,9 +212,10 @@ fn handle_session_start(args: &Value) -> Result<Value> {
     fs::create_dir_all(&sessions_root)?;
     let plan = recipe.plan(&uuid, &short, &sessions_root, repo.as_deref())?;
 
-    // Setup runs in the daemon (host fs). Roll back on failure.
+    // Setup runs in the daemon (host fs), with the AGENTRY_* context exported so
+    // a launch script can read it. Roll back on failure.
     for step in &plan.setup {
-        if !sh(step) {
+        if !sh_env(step, &plan.env) {
             run_steps_best_effort(&plan.teardown);
             bail!("setup step failed: {}", step);
         }
@@ -243,7 +243,7 @@ fn handle_session_start(args: &Value) -> Result<Value> {
             recipe.name
         );
     }
-    if !sh(&plan.launch) {
+    if !sh_env(&plan.launch, &plan.env) {
         run_steps_best_effort(&plan.teardown);
         bail!("launch failed: {}", plan.launch);
     }
@@ -276,11 +276,13 @@ fn handle_session_start(args: &Value) -> Result<Value> {
 
 // ---- execution helpers (moved from the old cmd.rs) ----
 
-/// Run a step through `sh -c`; returns whether it succeeded.
-fn sh(cmd: &str) -> bool {
+/// Run a step through `sh -c` with `AGENTRY_*` context exported; returns whether
+/// it succeeded. Used for `setup`/`launch`, which a `launch.sh` reads.
+fn sh_env(cmd: &str, env: &[(String, String)]) -> bool {
     Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

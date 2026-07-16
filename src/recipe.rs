@@ -4,11 +4,11 @@
 //! TOML file describing an agent template: identity (name, description, a
 //! CLAUDE.md guide) plus a `runtime` that decides how the agent runs.
 //!
-//! - `container` (default): agentry runs the agent in a docker/podman container
-//!   with `~/.claude` and the working directory mounted in — see
-//!   [`Recipe::container_steps`].
-//! - `foreground`: runs `command` (default `claude`) in your terminal, tearing
-//!   down on exit. Zero-dependency, not tracked.
+//! - `foreground` (default): runs `command` (default `claude`) in your terminal,
+//!   tearing down on exit. Zero-dependency and zero-config; not tracked.
+//! - `container`: agentry runs the recipe's `launch.sh` (podman run, mounts,
+//!   credentials, start the agent as PID 1); `attach`/`status`/`stop` are generic
+//!   podman ops on the container — see [`Recipe::podman_steps`].
 //! - `shell`: the recipe declares its own lifecycle as shell steps (`setup`,
 //!   `launch`, `status`, `attach`, `teardown`) — the escape hatch for tmux, jj
 //!   workspaces, cloud runners, anything.
@@ -22,10 +22,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Default agent image for the container runtime (built from the repo's
-/// `Dockerfile`; see `agentry image build`).
-const DEFAULT_IMAGE: &str = "agentry-agent:latest";
-
 /// The command run inside the session.
 const DEFAULT_COMMAND: &str = "claude";
 /// Where the session's working directory lives.
@@ -35,6 +31,10 @@ const DEFAULT_WORKDIR: &str = "{sessions_root}/{uuid}";
 const DEFAULT_SETUP: &[&str] = &["mkdir -p {workdir}"];
 /// Default teardown: remove the working directory.
 const DEFAULT_TEARDOWN: &[&str] = &["rm -rf {workdir}"];
+/// Default bring-up for the `container` runtime: run the recipe's launch script.
+/// Everything container-specific (podman run, mounts, credentials, the agent)
+/// lives in that script; agentry only owns the generic verbs.
+const DEFAULT_LAUNCH: &str = "sh {recipe_dir}/launch.sh";
 
 /// The fixed vocabulary of template variables. A `{name}` whose name is in this
 /// set is substituted (or errors, if referenced but unset); any other `{...}` —
@@ -47,6 +47,9 @@ const KNOWN_VARS: &[&str] = &[
     "sessions_root",
     "recipe_dir",
     "claude_md",
+    "claude_home",
+    "claude_json",
+    "control_socket",
     "repo",
     "command",
 ];
@@ -55,15 +58,17 @@ const KNOWN_VARS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Runtime {
-    /// Built-in: run the agent inside a container (docker/podman), isolated,
-    /// with `~/.claude` and the working directory mounted in. Default.
+    /// Run the agent in your terminal, tearing down on exit. Zero-dependency and
+    /// zero-config — the default for a bare recipe.
     #[default]
-    Container,
-    /// Run the agent in your terminal, tearing down on exit. Zero-dependency;
-    /// not tracked by `list`/`attach`/`stop`.
     Foreground,
+    /// Run the agent in a podman container. agentry runs the recipe's `launch.sh`
+    /// (which does the podman run, mounts, credentials, and starts the agent as
+    /// PID 1); `attach`/`status`/`stop` are generic podman ops on the container,
+    /// which is named after the session. See [`Recipe::podman_steps`].
+    Container,
     /// Run the recipe's own declared `setup`/`launch`/`status`/`attach`/
-    /// `teardown` steps — the escape hatch for tmux, cloud runners, anything.
+    /// `teardown` steps — the escape hatch for tmux, jj workspaces, anything.
     Shell,
 }
 
@@ -97,7 +102,7 @@ pub struct Recipe {
     #[serde(default)]
     pub claude_md_path: Option<PathBuf>,
 
-    /// How to run the agent. Default `container`.
+    /// How to run the agent. Default `foreground`.
     #[serde(default)]
     pub runtime: Runtime,
 
@@ -115,21 +120,7 @@ pub struct Recipe {
     #[serde(default)]
     pub workdir: Option<String>,
 
-    // ---- Container runtime knobs ----
-    /// Container image to run. Default `agentry-agent:latest`.
-    #[serde(default)]
-    pub image: Option<String>,
-    /// Extra bind mounts (`host:container`), passed as `-v` flags. `~/.claude`
-    /// and the working directory are always mounted.
-    #[serde(default)]
-    pub mounts: Option<Vec<String>>,
-    /// Mount the agentry control socket into the container (at `/run/agentry.sock`)
-    /// so the agent can manage the host fleet — `agentry list/start/stop/recipes`.
-    /// A trust grant: the agent gains full control of your fleet. Container only.
-    #[serde(default)]
-    pub control_socket: bool,
-
-    // ---- Shell runtime: declared lifecycle steps (unset ⇒ minimal default) ----
+    // ---- Lifecycle steps (shell runtime; container runtime uses `launch`) ----
     /// Steps to provision the workspace. Default: `mkdir -p {workdir}`.
     #[serde(default)]
     pub setup: Option<Vec<String>>,
@@ -168,6 +159,10 @@ pub struct Plan {
     pub status: String,
     pub attach: String,
     pub teardown: Vec<String>,
+    /// `AGENTRY_*` variables exported when running `setup`/`launch` — the
+    /// context a `launch.sh` reads (session name, workdir, credential paths,
+    /// control socket, opening message, …).
+    pub env: Vec<(String, String)>,
 }
 
 impl Recipe {
@@ -244,19 +239,29 @@ impl Recipe {
         if let Some(r) = repo {
             base.insert("repo", r.display().to_string());
         }
+        // Host context a launch script needs — the caller's credential paths and
+        // the control socket. Available both as `{vars}` and as `AGENTRY_*` env.
+        let claude_home_s = claude_home()?.display().to_string();
+        let claude_json_s = claude_json_host().display().to_string();
+        let control_socket_s = crate::protocol::socket_path().display().to_string();
+        base.insert("claude_home", claude_home_s.clone());
+        base.insert("claude_json", claude_json_s.clone());
+        base.insert("control_socket", control_socket_s.clone());
 
-        let command = subst(self.command.as_deref().unwrap_or(DEFAULT_COMMAND), &base)?;
+        let base_command = subst(self.command.as_deref().unwrap_or(DEFAULT_COMMAND), &base)?;
         let workdir = subst(self.workdir.as_deref().unwrap_or(DEFAULT_WORKDIR), &base)?;
 
-        // Seed an opening message as the agent's first prompt, if the recipe
-        // declares one: `claude` takes a positional prompt and stays
-        // interactive. Shell-quoted so it survives as a single argument through
-        // `sh -c` (and tmux, for the container runtime) intact.
-        let command = match self.message.as_deref() {
-            Some(m) if !m.is_empty() => {
-                format!("{} {}", command, shell_quote(&subst(m, &base)?))
-            }
-            _ => command,
+        // The opening message, sent on the user's behalf. For foreground/shell
+        // it's appended to the command as claude's first positional prompt
+        // (shell-quoted to survive as one arg). For the container runtime it's
+        // passed to launch.sh as `$AGENTRY_MESSAGE`, so the script delivers it.
+        let message = match self.message.as_deref() {
+            Some(m) if !m.is_empty() => Some(subst(m, &base)?),
+            _ => None,
+        };
+        let command = match &message {
+            Some(m) => format!("{} {}", base_command, shell_quote(m)),
+            None => base_command.clone(),
         };
 
         // Phase 2: full context, now including workdir + command.
@@ -275,16 +280,35 @@ impl Recipe {
                     subst_list(self.teardown.as_deref(), DEFAULT_TEARDOWN, &vars)?,
                 )
             }
-            Runtime::Container => {
-                let engine = container_engine().ok_or_else(|| {
-                    anyhow!(
-                        "no container engine found — install docker or podman, \
-                         or set AGENTRY_CONTAINER_ENGINE (or use runtime = \"foreground\")"
-                    )
-                })?;
-                self.container_steps(&engine, &session_name, &workdir, &command, &vars)?
-            }
+            Runtime::Container => self.podman_steps(&session_name, &vars)?,
         };
+
+        // The AGENTRY_* environment handed to setup/launch (what launch.sh reads).
+        let mut env: Vec<(String, String)> = vec![
+            ("AGENTRY_SESSION".into(), session_name.clone()),
+            ("AGENTRY_WORKDIR".into(), workdir.clone()),
+            (
+                "AGENTRY_SESSIONS_ROOT".into(),
+                sessions_root.display().to_string(),
+            ),
+            (
+                "AGENTRY_RECIPE_DIR".into(),
+                recipe_dir.display().to_string(),
+            ),
+            ("AGENTRY_CLAUDE_HOME".into(), claude_home_s),
+            ("AGENTRY_CLAUDE_JSON".into(), claude_json_s),
+            ("AGENTRY_CONTROL_SOCKET".into(), control_socket_s),
+            ("AGENTRY_COMMAND".into(), base_command),
+        ];
+        if let Some(cm) = self.claude_md_abs() {
+            env.push(("AGENTRY_CLAUDE_MD".into(), cm.display().to_string()));
+        }
+        if let Some(m) = &message {
+            env.push(("AGENTRY_MESSAGE".into(), m.clone()));
+        }
+        if let Some(r) = repo {
+            env.push(("AGENTRY_REPO".into(), r.display().to_string()));
+        }
 
         Ok(Plan {
             session_name,
@@ -296,84 +320,25 @@ impl Recipe {
             status,
             attach,
             teardown,
+            env,
         })
     }
 
-    /// Build the built-in container lifecycle: a detached container with
-    /// `~/.claude` and the working directory mounted, running the command under
-    /// tmux (for interactive attach). Returns
-    /// `(setup, launch, status, attach, teardown)`.
-    fn container_steps(
-        &self,
-        engine: &str,
-        session: &str,
-        workdir: &str,
-        command: &str,
-        vars: &HashMap<&str, String>,
-    ) -> Result<Steps> {
-        let image = self.image.as_deref().unwrap_or(DEFAULT_IMAGE);
-        let claude_home = claude_home()?;
-
-        // Always mount the caller's claude auth + the working directory.
-        let mut mount_flags = format!(
-            "-v {}:/root/.claude -v {}:/work",
-            claude_home.display(),
-            workdir
-        );
-        if let Some(extra) = &self.mounts {
-            for m in extra {
-                mount_flags.push_str(&format!(" -v {}", subst(m, vars)?));
-            }
-        }
-        // Mount the control socket so the agent can drive the host daemon.
-        if self.control_socket {
-            let sock = crate::protocol::socket_path();
-            mount_flags.push_str(&format!(
-                " -v {}:/run/agentry.sock -e AGENTRY_SOCKET=/run/agentry.sock",
-                sock.display()
-            ));
-        }
-
-        // Provision the host working directory (mounted at /work) and start a
-        // long-lived container. Its PID 1 is `sleep infinity` so it stays up
-        // independent of the agent; tmux + the agent are started via `exec`.
-        let mut setup = vec![format!("mkdir -p {}", workdir)];
-        if let Some(cm) = vars.get("claude_md") {
-            setup.push(format!("cp {} {}/CLAUDE.md", cm, workdir));
-        }
-        setup.push(format!(
-            "{engine} run -d --name {session} -e TERM=xterm-256color {mount_flags} -w /work \
-             {image} sleep infinity"
-        ));
-
-        // Carry the caller's Claude config (~/.claude.json: onboarding state +
-        // account) into the container so the agent doesn't re-run onboarding —
-        // the mounted ~/.claude only holds the token, not this. Copied, not
-        // mounted, so each container is isolated and never writes back to the
-        // host file; best-effort (skipped if the caller has no ~/.claude.json).
-        let claude_json = claude_json_host();
-        setup.push(format!(
-            "[ -f {json} ] && {engine} cp {json} {session}:/root/.claude.json || true",
-            json = claude_json.display()
-        ));
-        // Trust the working directory so the agent skips the "trust this folder?"
-        // prompt: patch ~/.claude.json in-container via the image's baked jq
-        // program. A no-op if jq is absent (older image), so spawn never breaks.
-        setup.push(format!(
-            "{engine} exec {session} sh -c 'command -v jq >/dev/null 2>&1 || exit 0; \
-             [ -f \"$HOME/.claude.json\" ] || printf \"{{}}\" > \"$HOME/.claude.json\"; \
-             jq -f /etc/agentry-trust.jq \"$HOME/.claude.json\" > \"$HOME/.claude.json.tmp\" \
-             && mv \"$HOME/.claude.json.tmp\" \"$HOME/.claude.json\"'"
-        ));
-
-        // Start the agent under tmux inside the container (attachable via exec).
-        let launch = format!("{engine} exec -d {session} tmux new-session -d -s agent {command}");
-        // Liveness = the agent's tmux session is alive (fails if the container
-        // is gone or the agent has exited).
-        let status = format!("{engine} exec {session} tmux has-session -t agent");
-        let attach = format!("{engine} exec -it {session} tmux attach -t agent");
-        let teardown = vec![format!("{engine} rm -f {session}")];
-
+    /// Build the container lifecycle. The bring-up — podman run, mounts,
+    /// credentials, starting the agent — is the recipe's `launch.sh` (run on the
+    /// host with `AGENTRY_*` env). agentry owns only the generic verbs, keyed on
+    /// the container name (which `launch.sh` sets to `$AGENTRY_SESSION`): the
+    /// agent runs as the container's PID 1, so container-alive == agent-alive.
+    /// Returns `(setup, launch, status, attach, teardown)`.
+    fn podman_steps(&self, session: &str, vars: &HashMap<&str, String>) -> Result<Steps> {
+        // setup is the recipe's (usually empty — launch.sh provisions the workdir).
+        let setup = subst_list(self.setup.as_deref(), &[], vars)?;
+        let launch = subst(self.launch.as_deref().unwrap_or(DEFAULT_LAUNCH), vars)?;
+        // Liveness: is a container of this name running?
+        let status = format!("podman ps -q -f name=^{session}$ -f status=running | grep -q .");
+        // Attach straight to PID 1 (the agent). Detach with the podman sequence.
+        let attach = format!("podman attach {session}");
+        let teardown = vec![format!("podman rm -f {session}")];
         Ok((setup, launch, status, attach, teardown))
     }
 }
@@ -575,9 +540,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_defaults_to_container() {
+    fn runtime_defaults_to_foreground() {
         let r = recipe("name = \"x\"\nclaude_md_path = \"./C.md\"\n");
-        assert_eq!(r.runtime, Runtime::Container);
+        assert_eq!(r.runtime, Runtime::Foreground);
     }
 
     #[test]
@@ -626,61 +591,43 @@ mod tests {
     }
 
     #[test]
-    fn container_steps_shape() {
-        let r = recipe("name = \"x\"\n");
-        let workdir = "/s/u";
-        let mut v = vars(&[("workdir", workdir), ("command", "claude")]);
-        v.insert("claude_md", "/tmp/recipes/x/C.md".into());
-        let (setup, launch, status, attach, teardown) = r
-            .container_steps("docker", "agent-abcd1234", workdir, "claude", &v)
-            .unwrap();
-
-        assert_eq!(setup[0], "mkdir -p /s/u");
-        assert!(setup
-            .iter()
-            .any(|s| s.contains("cp /tmp/recipes/x/C.md /s/u/CLAUDE.md")));
-        let run = setup.iter().find(|s| s.contains("run -d")).unwrap();
-        assert!(run.contains("docker run -d --name agent-abcd1234"));
-        assert!(
-            launch.contains("docker exec -d agent-abcd1234 tmux new-session -d -s agent claude")
+    fn container_plan_runs_launch_script_with_generic_verbs() {
+        let r = recipe("name = \"x\"\nruntime = \"container\"\n");
+        let plan = r.plan("u", "abcd1234", Path::new("/s"), None).unwrap();
+        // launch defaults to the recipe's launch.sh (recipe_dir = source parent).
+        assert_eq!(plan.launch, "sh /tmp/recipes/x/launch.sh");
+        // the verbs are generic podman ops keyed on the container name.
+        assert_eq!(
+            plan.status,
+            "podman ps -q -f name=^agent-abcd1234$ -f status=running | grep -q ."
         );
-        assert!(status.contains("docker exec agent-abcd1234 tmux has-session -t agent"));
-        assert!(attach.contains("docker exec -it agent-abcd1234 tmux attach -t agent"));
-        assert_eq!(teardown, vec!["docker rm -f agent-abcd1234"]);
-        // default image
-        assert!(run.contains("agentry-agent:latest"));
-        // caller's onboarding config is copied in, and /work is trusted
-        assert!(setup.iter().any(|s| s.contains(":/root/.claude.json")));
-        assert!(setup.iter().any(|s| s.contains("agentry-trust.jq")));
+        assert_eq!(plan.attach, "podman attach agent-abcd1234");
+        assert_eq!(plan.teardown, vec!["podman rm -f agent-abcd1234"]);
+        // no baked setup — launch.sh provisions everything.
+        assert!(plan.setup.is_empty());
     }
 
     #[test]
-    fn container_steps_honor_custom_image_and_mounts() {
-        let r = recipe("name = \"x\"\nimage = \"my/img:1\"\nmounts = [\"/host:/c\"]\n");
-        let v = vars(&[("workdir", "/w"), ("command", "claude")]);
-        let (setup, _, _, _, _) = r
-            .container_steps("podman", "agent-z", "/w", "claude", &v)
-            .unwrap();
-        // image + extra mounts land in the `run` command (the last setup step).
-        let run = setup.iter().find(|s| s.contains("run -d")).unwrap();
-        assert!(run.starts_with("podman run -d"));
-        assert!(run.contains("my/img:1"));
-        assert!(run.contains("-v /host:/c"));
-        assert!(run.contains("-v /w:/work"));
+    fn container_plan_honors_custom_launch() {
+        let r =
+            recipe("name = \"x\"\nruntime = \"container\"\nlaunch = \"sh {recipe_dir}/go.sh\"\n");
+        let plan = r.plan("u", "abcd1234", Path::new("/s"), None).unwrap();
+        assert_eq!(plan.launch, "sh /tmp/recipes/x/go.sh");
     }
 
     #[test]
-    fn container_steps_mount_control_socket() {
-        let r = recipe("name = \"x\"\ncontrol_socket = true\n");
-        let v = vars(&[("workdir", "/w"), ("command", "claude")]);
-        let (setup, _, _, _, _) = r
-            .container_steps("podman", "agent-z", "/w", "claude", &v)
-            .unwrap();
-        let run = setup.iter().find(|s| s.contains("run -d")).unwrap();
-        assert!(run.contains(":/run/agentry.sock"), "run: {run}");
-        assert!(
-            run.contains("-e AGENTRY_SOCKET=/run/agentry.sock"),
-            "run: {run}"
+    fn plan_env_carries_context_and_raw_message() {
+        let r = recipe(
+            "name = \"x\"\nruntime = \"container\"\nclaude_md_path = \"./C.md\"\n\
+             message = \"hi there\"\n",
         );
+        let plan = r.plan("u", "abcd1234", Path::new("/s"), None).unwrap();
+        let env: std::collections::HashMap<_, _> = plan.env.into_iter().collect();
+        assert_eq!(env.get("AGENTRY_SESSION").unwrap(), "agent-abcd1234");
+        assert_eq!(env.get("AGENTRY_WORKDIR").unwrap(), "/s/u");
+        // the message reaches launch.sh raw (not shell-quoted — the script quotes it).
+        assert_eq!(env.get("AGENTRY_MESSAGE").unwrap(), "hi there");
+        assert!(env.contains_key("AGENTRY_CLAUDE_HOME"));
+        assert!(env.contains_key("AGENTRY_CONTROL_SOCKET"));
     }
 }

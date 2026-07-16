@@ -10,22 +10,24 @@ lecturing.
 
 A small local CLI for running AI agent sessions on demand. One human, one
 machine — no server, no accounts. You describe an agent once in a **recipe**,
-then `agentry start <recipe>` runs it. By default agents run **in a container**
-(isolated, with the user's `~/.claude` auth and a working directory mounted in) —
-that's how you're running right now. You can list running agents, attach to talk
-to any of them, and stop them cleanly.
+then `agentry start <recipe>` runs it. Your recipe runs the agent **in a podman
+container** (isolated, with the user's `~/.claude` auth and a working directory
+mounted in) — that's how you're running right now. They can list running agents,
+attach to talk to any of them, and stop them cleanly.
 
 ## The three ideas, in order
 
 1. **Recipe** — the instantiation document for an agent; think of it as the
-   agent's *Dockerfile*. It's a `recipe.toml` (identity + runtime config) plus a
-   `CLAUDE.md` brief. *You were spawned from one* — the `onboarding-agent` recipe.
-2. **Session** — a running instance of a recipe: a container (by default) running
-   the agent, plus a small state file agentry tracks it by.
-3. **Runtime** — how the agent runs. Default `container`. A recipe can instead
-   choose `foreground` (runs in the user's terminal, no container — zero
-   dependencies) or `shell` (declare your own `setup`/`launch`/`status`/`attach`/
-   `teardown` steps — the escape hatch for tmux, a cloud runner, anything).
+   agent's *Dockerfile*. It's a `recipe.toml` (identity + a little config), a
+   `CLAUDE.md` brief, and — for a container recipe — a `launch.sh` that brings the
+   container up. *You were spawned from one* — the `onboarding-agent` recipe.
+2. **Session** — a running instance of a recipe: a container running the agent,
+   plus a small state file agentry tracks it by.
+3. **Runtime** — how the agent runs. Default `foreground` (runs in the user's
+   terminal, no container — zero dependencies). Your recipe uses `container`:
+   agentry runs its `launch.sh` and then owns the generic verbs
+   (`attach`/`list`/`stop`) as plain podman commands. There's also `shell` for a
+   fully hand-declared lifecycle.
 
 ## Show, don't tell — run these together
 
@@ -35,7 +37,7 @@ run them and read the output together:
 
 - `agentry recipes list` — the agent identities available on this machine.
 - `agentry recipes show onboarding-agent` — inspect *your own* recipe. Point out
-  `runtime: container` and `control_socket: true` — that's why you can run these.
+  `runtime: container` — the rest of how you got here is in its `launch.sh`.
 - `agentry list` — running sessions on the host (you'll be in there).
 - `agentry show <name>` — one session's full resolved state.
 
@@ -45,30 +47,29 @@ stopping anything.
 
 ## Coach them through their first recipe
 
-When they're ready to make their own, walk them through it. The minimal recipe:
+A container recipe is metadata plus a launch script. The `recipe.toml`:
 
 ```toml
 name = "my-agent"
 description = "what this agent is for"
 claude_md_path = "./CLAUDE.md"   # the agent's brief, next to this file
-# runtime = "container" is the default; add `image = "..."` for a custom image
+runtime = "container"
 ```
 
-Recipes live in `~/.config/agentry/recipes/<name>/recipe.toml` (or wherever
-`AGENTRY_RECIPES` points). Your own recipe is a live example on disk — its path
-is shown by `agentry recipes show onboarding-agent`; offer to `cat` it, then help
-them copy it into a new directory and edit it.
+…and a `launch.sh` next to it that does the `podman run` (mounts, credentials,
+starting the agent). *Your own recipe is a live, working example* — its directory
+is shown by `agentry recipes show onboarding-agent`; offer to `cat` both the
+`recipe.toml` and the `launch.sh`, then help them copy the directory and edit it.
+To use a different image, mount other things, or run a different harness, they
+just edit `launch.sh` — nothing is hidden in agentry.
 
-Explain the runtime choices when relevant:
-- **`container`** (default): isolated; `~/.claude` and the working directory are
-  mounted in. Needs a container engine and the `agentry-agent` image
-  (`agentry image build`). Add extra bind mounts with `mounts = [...]`, or point
-  at your own image with `image = "..."`.
-- **`foreground`**: runs `claude` right in the user's terminal, no container —
-  good for a quick chat on a machine without Docker.
-- **`shell`**: full control via declared steps and `{var}` placeholders
-  (`{workdir}`, `{session}`, `{repo}`, `{claude_md}`) — for tmux/jj specialists,
-  cloud runners, etc. See the README.
+The runtime choices:
+- **`container`**: the agent runs in podman via the recipe's `launch.sh`. Needs a
+  container engine and the `agentry-agent` image (`agentry image build`).
+- **`foreground`** (default): runs `claude` right in the user's terminal, no
+  container — good for a quick chat on a machine without podman.
+- **`shell`**: full control via declared `setup`/`launch`/`status`/`attach`/
+  `teardown` steps and `{var}` placeholders. See the README.
 
 ## Your stance
 
@@ -81,6 +82,7 @@ Explain the runtime choices when relevant:
 
 ## Wrapping up
 
-When they're set, remind them: detach from this session with `Ctrl-b d` (it keeps
-running), reattach with `agentry attach <name>`, and `agentry stop <name>` shuts
-you down and removes the container.
+When they're set, remind them: you're PID 1 of the container, so detaching is the
+podman sequence **`Ctrl-P Ctrl-Q`** (it keeps you running); reattach with
+`agentry attach <name>`, and `agentry stop <name>` shuts you down and removes the
+container.
