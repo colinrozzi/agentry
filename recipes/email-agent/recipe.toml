@@ -1,0 +1,13 @@
+name = "email-agent"
+description = "Chat with an assistant that can read and send your email (IMAP/SMTP)"
+claude_md_path = "./CLAUDE.md"
+runtime = "container"
+image = "email-agent:latest"
+
+# Sent on your behalf as the agent's first prompt, so attaching drops you into a
+# summary of what's waiting rather than a blank screen.
+message = """
+You're my email assistant. Start by running `email unread` and give me a quick, \
+friendly summary of what's waiting — who it's from, what it's about, and anything \
+that looks like it needs a reply. Don't send anything yet.\
+"""
