@@ -50,6 +50,7 @@ const KNOWN_VARS: &[&str] = &[
     "claude_home",
     "claude_json",
     "control_socket",
+    "image",
     "repo",
     "command",
 ];
@@ -119,6 +120,13 @@ pub struct Recipe {
     /// container runtime). Default `{sessions_root}/{uuid}`.
     #[serde(default)]
     pub workdir: Option<String>,
+
+    /// Container image tag the recipe runs. If set and the recipe directory ships
+    /// a `Dockerfile`, agentry builds it on `start` when the image isn't present
+    /// yet — so a shared recipe is self-contained (no separate build step).
+    /// Exposed to `launch.sh` as `$AGENTRY_IMAGE` and the `{image}` variable.
+    #[serde(default)]
+    pub image: Option<String>,
 
     // ---- Lifecycle steps (shell runtime; container runtime uses `launch`) ----
     /// Steps to provision the workspace. Default: `mkdir -p {workdir}`.
@@ -247,6 +255,9 @@ impl Recipe {
         base.insert("claude_home", claude_home_s.clone());
         base.insert("claude_json", claude_json_s.clone());
         base.insert("control_socket", control_socket_s.clone());
+        if let Some(img) = &self.image {
+            base.insert("image", img.clone());
+        }
 
         let base_command = subst(self.command.as_deref().unwrap_or(DEFAULT_COMMAND), &base)?;
         let workdir = subst(self.workdir.as_deref().unwrap_or(DEFAULT_WORKDIR), &base)?;
@@ -269,7 +280,7 @@ impl Recipe {
         vars.insert("workdir", workdir.clone());
         vars.insert("command", command.clone());
 
-        let (setup, launch, status, attach, teardown) = match self.runtime {
+        let (mut setup, launch, status, attach, teardown) = match self.runtime {
             Runtime::Foreground | Runtime::Shell => {
                 // The declarative engine: the recipe's steps, or minimal defaults.
                 (
@@ -282,6 +293,21 @@ impl Recipe {
             }
             Runtime::Container => self.podman_steps(&session_name, &vars)?,
         };
+
+        // Self-contained recipes: if the recipe declares an image and ships a
+        // Dockerfile next to it, build the image on `start` when it's missing —
+        // so an installed recipe just works without a separate build step.
+        if let Some(img) = &self.image {
+            if self.runtime == Runtime::Container && recipe_dir.join("Dockerfile").is_file() {
+                setup.insert(
+                    0,
+                    format!(
+                        "podman image exists {img} || podman build {dir} -t {img}",
+                        dir = recipe_dir.display()
+                    ),
+                );
+            }
+        }
 
         // The AGENTRY_* environment handed to setup/launch (what launch.sh reads).
         let mut env: Vec<(String, String)> = vec![
@@ -308,6 +334,9 @@ impl Recipe {
         }
         if let Some(r) = repo {
             env.push(("AGENTRY_REPO".into(), r.display().to_string()));
+        }
+        if let Some(img) = &self.image {
+            env.push(("AGENTRY_IMAGE".into(), img.clone()));
         }
 
         Ok(Plan {
@@ -629,5 +658,36 @@ mod tests {
         assert_eq!(env.get("AGENTRY_MESSAGE").unwrap(), "hi there");
         assert!(env.contains_key("AGENTRY_CLAUDE_HOME"));
         assert!(env.contains_key("AGENTRY_CONTROL_SOCKET"));
+    }
+
+    #[test]
+    fn container_image_exposes_agentry_image() {
+        let r = recipe("name = \"x\"\nruntime = \"container\"\nimage = \"my/img:1\"\n");
+        let plan = r.plan("u", "abcd1234", Path::new("/s"), None).unwrap();
+        let env: std::collections::HashMap<_, _> = plan.env.into_iter().collect();
+        assert_eq!(env.get("AGENTRY_IMAGE").unwrap(), "my/img:1");
+        // no Dockerfile next to this synthetic recipe → no build step is inserted.
+        assert!(!plan.setup.iter().any(|s| s.contains("podman build")));
+    }
+
+    #[test]
+    fn container_image_with_dockerfile_builds_on_start() {
+        let dir =
+            std::env::temp_dir().join(format!("agentry-test-imgbuild-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Dockerfile"), "FROM debian:stable-slim\n").unwrap();
+        let mut r: Recipe =
+            toml::from_str("name = \"x\"\nruntime = \"container\"\nimage = \"my/img:1\"\n")
+                .unwrap();
+        r.source = dir.join("recipe.toml");
+        let plan = r.plan("u", "abcd1234", Path::new("/s"), None).unwrap();
+        // the build-if-missing step is prepended to setup.
+        assert!(
+            plan.setup[0].contains("podman image exists my/img:1"),
+            "{}",
+            plan.setup[0]
+        );
+        assert!(plan.setup[0].contains(&format!("podman build {}", dir.display())));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -71,6 +71,8 @@ agentry recipes list                 # enumerate recipes in the search path
 agentry recipes show <name|path> [--raw]   # metadata (or the raw recipe.toml)
 agentry recipes write <name> --from <dir>  # create/update a recipe (recipe.toml [+ CLAUDE.md])
 agentry recipes rm <name>            # delete a recipe
+agentry recipes export <name> [-o <file>]  # bundle a recipe to share (<name>.recipe)
+agentry recipes install <bundle>     # install a shared recipe bundle
 
 agentry start <recipe> [--repo <p>] [--for <ticket>]
 agentry list                         # tracked sessions + their liveness
@@ -127,15 +129,21 @@ agentry:
 name = "coding"
 claude_md_path = "./CLAUDE.md"
 runtime = "container"
+image = "coding-agent:latest"   # optional; with a Dockerfile in the dir, builds on `start`
 # launch defaults to `sh {recipe_dir}/launch.sh`; override any verb if you need to
 ```
 
 `launch.sh` gets its context as `AGENTRY_*` environment variables — e.g.
 `AGENTRY_SESSION` (the container name to use), `AGENTRY_WORKDIR`,
 `AGENTRY_CLAUDE_HOME`, `AGENTRY_CLAUDE_JSON`, `AGENTRY_CONTROL_SOCKET`,
-`AGENTRY_MESSAGE`. It does the `podman run` however it likes; to use a different
-image, mount other things, or run a different harness, you edit that one file.
-See the seeded `onboarding-agent/launch.sh` for a worked example.
+`AGENTRY_MESSAGE`, `AGENTRY_IMAGE`. It does the `podman run` however it likes; to
+use a different image, mount other things, or run a different harness, you edit
+that one file. See the seeded `onboarding-agent/launch.sh` for a worked example.
+
+**Self-contained recipes.** If a recipe sets `image` and keeps a `Dockerfile` in
+its own directory, agentry builds that image on `start` when it isn't present yet
+(and `launch.sh` runs `"$AGENTRY_IMAGE"`). So the recipe carries everything it
+needs — no separate `image build` step — which is what makes recipes shareable.
 
 ### The `shell` runtime — declared steps
 
@@ -187,6 +195,24 @@ same as the `claude` process they launch.
 2. `$XDG_CONFIG_HOME/agentry/recipes/` (typically `~/.config/agentry/recipes/`)
 
 You can also bypass the search path: `agentry start /tmp/my-recipe.toml`.
+
+### Sharing recipes
+
+A recipe is a self-contained directory (`recipe.toml` + `launch.sh` + `CLAUDE.md`
++ any `Dockerfile`/assets), so sharing one is bundle-in, bundle-out:
+
+```sh
+agentry recipes export coding            # → coding.recipe (a tar of the directory)
+# …send coding.recipe however you like…
+agentry recipes install ./coding.recipe  # unpacks it into your recipes directory
+agentry start coding                     # image builds automatically on first start
+```
+
+`export` tars the recipe's directory; `install` unpacks it into your primary
+recipes dir and validates it. The **image** rebuilds locally on first `start`
+(from the bundled `Dockerfile`), so the recipe travels — but **secrets don't**:
+a recipe references per-user credentials by path (e.g. `~/.config/agentry/secrets/
+foo.env`), which each person supplies themselves.
 
 ### Session lifecycle
 

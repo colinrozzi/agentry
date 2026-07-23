@@ -115,3 +115,103 @@ fn print_next_steps() {
     println!("  agentry start onboarding-agent   # spawn it in a container");
     println!("  agentry attach <name>            # attach and chat (name from `agentry list`)");
 }
+
+/// Export a recipe to a shareable bundle: a gzip'd tar of the recipe's whole
+/// directory, named `<name>.recipe` by default. `agentry recipes install`
+/// unpacks it on the other side.
+pub fn recipes_export(name: &str, out: Option<&str>) -> Result<()> {
+    let recipe = recipe::resolve(name)?;
+    let dir = recipe
+        .source
+        .parent()
+        .ok_or_else(|| anyhow!("recipe {} has no parent directory", recipe.name))?;
+    let parent = dir
+        .parent()
+        .ok_or_else(|| anyhow!("recipe directory {} has no parent", dir.display()))?;
+    let dir_name = dir
+        .file_name()
+        .ok_or_else(|| anyhow!("recipe directory {} has no name", dir.display()))?;
+    let out = out
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{}.recipe", recipe.name)));
+
+    let ok = Command::new("tar")
+        .arg("czf")
+        .arg(&out)
+        .arg("-C")
+        .arg(parent)
+        .arg(dir_name)
+        .status()
+        .context("running tar")?;
+    if !ok.success() {
+        return Err(anyhow!("tar failed to create {}", out.display()));
+    }
+    println!("exported '{}' -> {}", recipe.name, out.display());
+    println!(
+        "share it, then on the other machine:  agentry recipes install {}",
+        out.display()
+    );
+    Ok(())
+}
+
+/// Install a recipe bundle (from `recipes export`) into the primary recipes
+/// directory, validate it, and report how to start it.
+pub fn recipes_install(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow!("bundle not found: {}", path.display()));
+    }
+    let recipes_root = recipe::search_path()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("could not determine a recipes directory"))?;
+    std::fs::create_dir_all(&recipes_root)
+        .with_context(|| format!("creating {}", recipes_root.display()))?;
+
+    // Peek at the bundle's top-level directory (the recipe's folder name).
+    let listing = Command::new("tar")
+        .arg("tzf")
+        .arg(path)
+        .output()
+        .context("running tar tzf")?;
+    if !listing.status.success() {
+        return Err(anyhow!("not a readable .recipe bundle: {}", path.display()));
+    }
+    let top = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .next()
+        .and_then(|l| l.split('/').next())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("bundle {} is empty", path.display()))?;
+
+    let ok = Command::new("tar")
+        .arg("xzf")
+        .arg(path)
+        .arg("-C")
+        .arg(&recipes_root)
+        .status()
+        .context("running tar xzf")?;
+    if !ok.success() {
+        return Err(anyhow!("tar failed to extract {}", path.display()));
+    }
+
+    let installed = recipes_root.join(&top);
+    let toml_path = installed.join("recipe.toml");
+    if !toml_path.is_file() {
+        return Err(anyhow!(
+            "bundle did not contain a recipe.toml (looked in {})",
+            installed.display()
+        ));
+    }
+    let recipe = recipe::Recipe::from_path(&toml_path)
+        .with_context(|| format!("installed recipe at {} does not parse", installed.display()))?;
+
+    println!("installed '{}' at {}", recipe.name, installed.display());
+    if let Some(img) = &recipe.image {
+        if installed.join("Dockerfile").is_file() {
+            println!("  image {img} builds automatically on first `agentry start`");
+        }
+    }
+    println!("  start it with:  agentry start {}", recipe.name);
+    Ok(())
+}
