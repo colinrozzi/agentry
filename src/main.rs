@@ -108,6 +108,19 @@ enum RecipesCmd {
         /// Recipe name.
         name: String,
     },
+    /// Export a recipe to a shareable bundle (a `.recipe` tarball of its directory).
+    Export {
+        /// Recipe name.
+        name: String,
+        /// Output file (default: `<name>.recipe` in the current directory).
+        #[arg(short, long)]
+        out: Option<String>,
+    },
+    /// Install a recipe bundle (from `recipes export`) into your recipes directory.
+    Install {
+        /// Path to a `.recipe` bundle.
+        path: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -135,6 +148,9 @@ fn main() -> Result<()> {
                 client::recipes_write(&name, std::path::Path::new(&from))
             }
             RecipesCmd::Rm { name } => client::recipes_delete(&name),
+            // Export/install are local file operations — no daemon needed.
+            RecipesCmd::Export { name, out } => cmd::recipes_export(&name, out.as_deref()),
+            RecipesCmd::Install { path } => cmd::recipes_install(std::path::Path::new(&path)),
         },
         Cmd::Start {
             recipe,
