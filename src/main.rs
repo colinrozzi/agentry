@@ -121,6 +121,13 @@ enum RecipesCmd {
         /// Path to a `.recipe` bundle.
         path: String,
     },
+    /// Import one recipe by name from a source: a git repo, a directory, or a `.recipe` URL.
+    Import {
+        /// Recipe name.
+        name: String,
+        /// Source: `owner/repo`, a git URL, a local directory, or a `.recipe` URL.
+        source: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -151,6 +158,7 @@ fn main() -> Result<()> {
             // Export/install are local file operations — no daemon needed.
             RecipesCmd::Export { name, out } => cmd::recipes_export(&name, out.as_deref()),
             RecipesCmd::Install { path } => cmd::recipes_install(std::path::Path::new(&path)),
+            RecipesCmd::Import { name, source } => cmd::recipes_import(&name, &source),
         },
         Cmd::Start {
             recipe,

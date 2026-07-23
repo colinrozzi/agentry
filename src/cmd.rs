@@ -215,3 +215,142 @@ pub fn recipes_install(path: &std::path::Path) -> Result<()> {
     println!("  start it with:  agentry start {}", recipe.name);
     Ok(())
 }
+
+/// Import a single recipe by name from a source: a local directory, a git repo,
+/// or a `.recipe` bundle (local file or URL). The recipe is looked for both at
+/// the source root (`<source>/<name>/`) and under a `recipes/` subdir
+/// (`<source>/recipes/<name>/`), so both dedicated recipe repos and monorepos work.
+pub fn recipes_import(name: &str, source: &str) -> Result<()> {
+    let src_path = std::path::Path::new(source);
+
+    // 1. A local directory that holds recipes.
+    if src_path.is_dir() {
+        let dir = find_recipe_dir(src_path, name)
+            .ok_or_else(|| anyhow!("no recipe '{name}' under {}", src_path.display()))?;
+        return bundle_and_install(&dir);
+    }
+
+    // 2. A `.recipe` bundle — a local file, or a URL to download.
+    if source.ends_with(".recipe") {
+        if src_path.is_file() {
+            return recipes_install(src_path);
+        }
+        let tmp =
+            std::env::temp_dir().join(format!("agentry-import-{}.recipe", std::process::id()));
+        let ok = Command::new("curl")
+            .args(["-fsSL", source, "-o"])
+            .arg(&tmp)
+            .status()
+            .context("running curl")?;
+        if !ok.success() {
+            return Err(anyhow!("failed to download {source}"));
+        }
+        let r = recipes_install(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        return r;
+    }
+
+    // 3. Otherwise treat it as a git repo.
+    import_from_git(name, source)
+}
+
+/// Look for a recipe directory named `name` at `base/<name>` or `base/recipes/<name>`.
+fn find_recipe_dir(base: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    [base.join(name), base.join("recipes").join(name)]
+        .into_iter()
+        .find(|c| c.join("recipe.toml").is_file())
+}
+
+/// Normalize a source into a git URL. `owner/repo` and `github.com/owner/repo`
+/// become `https://github.com/...`; anything with a scheme or scp-style host is
+/// used as-is.
+fn git_url(source: &str) -> String {
+    if source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("git@")
+        || source.starts_with("ssh://")
+    {
+        source.to_string()
+    } else if let Some(rest) = source.strip_prefix("github.com/") {
+        format!("https://github.com/{rest}")
+    } else if source.matches('/').count() == 1 {
+        format!("https://github.com/{source}")
+    } else {
+        source.to_string()
+    }
+}
+
+fn import_from_git(name: &str, source: &str) -> Result<()> {
+    let url = git_url(source);
+    let tmp = std::env::temp_dir().join(format!("agentry-import-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    println!("fetching {url} …");
+    let ok = Command::new("git")
+        .args(["clone", "--depth", "1", &url])
+        .arg(&tmp)
+        .status()
+        .context("running git clone (is git installed?)")?;
+    if !ok.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(anyhow!("git clone failed: {url}"));
+    }
+    let result = match find_recipe_dir(&tmp, name) {
+        Some(dir) => bundle_and_install(&dir),
+        None => Err(anyhow!(
+            "no recipe '{name}' in {url} (looked at the root and recipes/)"
+        )),
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Tar a recipe directory into a temp bundle and install it — so directory and
+/// git sources reuse the same validate/report path as a `.recipe` bundle.
+fn bundle_and_install(recipe_dir: &std::path::Path) -> Result<()> {
+    let parent = recipe_dir
+        .parent()
+        .ok_or_else(|| anyhow!("recipe dir {} has no parent", recipe_dir.display()))?;
+    let name = recipe_dir
+        .file_name()
+        .ok_or_else(|| anyhow!("recipe dir {} has no name", recipe_dir.display()))?;
+    let tmp = std::env::temp_dir().join(format!("agentry-import-b-{}.recipe", std::process::id()));
+    let ok = Command::new("tar")
+        .arg("czf")
+        .arg(&tmp)
+        .arg("-C")
+        .arg(parent)
+        .arg(name)
+        .status()
+        .context("running tar")?;
+    if !ok.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!("tar failed to bundle {}", recipe_dir.display()));
+    }
+    let r = recipes_install(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::git_url;
+
+    #[test]
+    fn git_url_normalizes_sources() {
+        assert_eq!(git_url("owner/repo"), "https://github.com/owner/repo");
+        assert_eq!(
+            git_url("github.com/owner/repo"),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            git_url("https://github.com/owner/repo"),
+            "https://github.com/owner/repo"
+        );
+        assert_eq!(
+            git_url("git@github.com:owner/repo.git"),
+            "git@github.com:owner/repo.git"
+        );
+        // a deeper path isn't a bare owner/repo — left as-is (used verbatim).
+        assert_eq!(git_url("example.com/a/b/c"), "example.com/a/b/c");
+    }
+}
