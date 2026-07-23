@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""email — a tiny read/send CLI over IMAP+SMTP, for an agentry email agent.
+
+Credentials come from /run/email.env (mounted read-only) or the environment:
+  EMAIL_USER=you@example.com
+  EMAIL_APP=<app password>           (EMAIL_APP_PASSWORD also accepted)
+Provider hosts default to Gmail; override for another provider:
+  IMAP_HOST=imap.example.com   SMTP_HOST=smtp.example.com   SMTP_PORT=587
+
+Commands:
+  email unread [N]           list the N most recent unread messages (default 10)
+  email recent [N]           list the N most recent inbox messages (default 10)
+  email show <uid>           print one message (headers + text body) by UID
+  email search <imap query>  e.g. `email search FROM alice@x.com`  /  `email search SUBJECT invoice`
+  email send --to A --subject S [--body B | --body-file F | -]  [--cc C] [--reply-to UID]
+
+UIDs are stable handles you can pass to `show` and `--reply-to`.
+"""
+import argparse
+import email
+import email.utils
+import imaplib
+import os
+import smtplib
+import sys
+from email.header import decode_header, make_header
+from email.message import EmailMessage
+
+IMAP_HOST = os.environ.get("IMAP_HOST", "imap.gmail.com")
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+
+
+def creds():
+    data = {}
+    path = "/run/email.env"
+    if os.path.exists(path):
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            data[k.strip()] = v.strip().strip('"').strip("'")
+    user = data.get("EMAIL_USER") or os.environ.get("EMAIL_USER")
+    pw = (
+        data.get("EMAIL_APP")
+        or data.get("EMAIL_APP_PASSWORD")
+        or os.environ.get("EMAIL_APP")
+        or os.environ.get("EMAIL_APP_PASSWORD")
+    )
+    if not user or not pw:
+        sys.exit("email: missing EMAIL_USER / EMAIL_APP (checked /run/email.env and env)")
+    return user, pw.replace(" ", "")
+
+
+def imap():
+    user, pw = creds()
+    M = imaplib.IMAP4_SSL(IMAP_HOST)
+    M.login(user, pw)
+    return M
+
+
+def dh(raw):
+    """Decode a possibly-MIME-encoded header to a str."""
+    if raw is None:
+        return ""
+    try:
+        return str(make_header(decode_header(raw)))
+    except Exception:
+        return raw
+
+
+def body_text(msg):
+    """Best-effort plain-text body."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain" and "attachment" not in str(
+                part.get("Content-Disposition", "")
+            ):
+                try:
+                    return part.get_content()
+                except Exception:
+                    return part.get_payload(decode=True).decode(errors="replace")
+        return "(no text/plain part)"
+    try:
+        return msg.get_content()
+    except Exception:
+        return msg.get_payload(decode=True).decode(errors="replace")
+
+
+def uid_list(M, query):
+    M.select("INBOX")
+    typ, data = M.uid("SEARCH", None, *query)
+    if typ != "OK":
+        sys.exit(f"email: search failed: {data}")
+    return data[0].split()
+
+
+def list_cmd(query, n):
+    M = imap()
+    uids = uid_list(M, query)[-n:][::-1]
+    if not uids:
+        print("(none)")
+        return
+    for u in uids:
+        typ, d = M.uid("FETCH", u, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+        hdr = email.message_from_bytes(d[0][1])
+        uid = u.decode()
+        frm = dh(hdr.get("From"))
+        subj = dh(hdr.get("Subject")) or "(no subject)"
+        date = dh(hdr.get("Date"))
+        print(f"[{uid}]  {frm}\n        {subj}\n        {date}\n")
+    M.logout()
+
+
+def show_cmd(uid):
+    M = imap()
+    M.select("INBOX")
+    typ, d = M.uid("FETCH", uid.encode(), "(RFC822)")
+    if typ != "OK" or not d or d[0] is None:
+        sys.exit(f"email: no message with uid {uid}")
+    msg = email.message_from_bytes(d[0][1])
+    print(f"From:    {dh(msg.get('From'))}")
+    print(f"To:      {dh(msg.get('To'))}")
+    print(f"Date:    {dh(msg.get('Date'))}")
+    print(f"Subject: {dh(msg.get('Subject'))}")
+    print(f"UID:     {uid}")
+    print("-" * 60)
+    print(body_text(msg).strip())
+    M.logout()
+
+
+def send_cmd(a):
+    user, pw = creds()
+    if a.body_file == "-" or a.stdin:
+        body = sys.stdin.read()
+    elif a.body_file:
+        body = open(a.body_file).read()
+    elif a.body is not None:
+        body = a.body
+    else:
+        sys.exit("email send: need --body, --body-file, or - (stdin)")
+
+    msg = EmailMessage()
+    msg["From"] = user
+    msg["To"] = a.to
+    if a.cc:
+        msg["Cc"] = a.cc
+    subject = a.subject or ""
+
+    if a.reply_to:
+        M = imap()
+        M.select("INBOX")
+        typ, d = M.uid(
+            "FETCH", a.reply_to.encode(),
+            "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES SUBJECT)])",
+        )
+        if typ == "OK" and d and d[0]:
+            orig = email.message_from_bytes(d[0][1])
+            mid = orig.get("Message-ID")
+            if mid:
+                msg["In-Reply-To"] = mid
+                refs = orig.get("References", "")
+                msg["References"] = (refs + " " + mid).strip()
+            osub = dh(orig.get("Subject")) or ""
+            if not subject:
+                subject = osub if osub.lower().startswith("re:") else f"Re: {osub}"
+        M.logout()
+
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+    s.starttls()
+    s.login(user, pw)
+    s.send_message(msg)
+    s.quit()
+    print(f"sent to {a.to}" + (f" (cc {a.cc})" if a.cc else "") + f" — subject: {subject!r}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="email")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    u = sub.add_parser("unread"); u.add_argument("n", nargs="?", type=int, default=10)
+    r = sub.add_parser("recent"); r.add_argument("n", nargs="?", type=int, default=10)
+    sh = sub.add_parser("show"); sh.add_argument("uid")
+    se = sub.add_parser("search"); se.add_argument("query", nargs="+")
+    sd = sub.add_parser("send")
+    sd.add_argument("--to", required=True)
+    sd.add_argument("--cc")
+    sd.add_argument("--subject")
+    sd.add_argument("--body")
+    sd.add_argument("--body-file")
+    sd.add_argument("-", dest="stdin", action="store_true")
+    sd.add_argument("--reply-to")
+    a = p.parse_args()
+
+    if a.cmd == "unread":
+        list_cmd(["UNSEEN"], a.n)
+    elif a.cmd == "recent":
+        list_cmd(["ALL"], a.n)
+    elif a.cmd == "show":
+        show_cmd(a.uid)
+    elif a.cmd == "search":
+        list_cmd(a.query, 25)
+    elif a.cmd == "send":
+        send_cmd(a)
+
+
+if __name__ == "__main__":
+    main()
