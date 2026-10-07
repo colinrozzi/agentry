@@ -73,6 +73,7 @@ agentry recipes write <name> --from <dir>  # create/update a recipe (recipe.toml
 agentry recipes rm <name>            # delete a recipe
 agentry recipes export <name> [-o <file>]  # bundle a recipe to share (<name>.recipe)
 agentry recipes install <bundle>     # install a shared recipe bundle
+agentry recipes import <name> <source>  # pull one recipe by name from a repo/dir/URL
 
 agentry start <recipe> [--repo <p>] [--for <ticket>]
 agentry list                         # tracked sessions + their liveness
@@ -213,6 +214,19 @@ recipes dir and validates it. The **image** rebuilds locally on first `start`
 (from the bundled `Dockerfile`), so the recipe travels — but **secrets don't**:
 a recipe references per-user credentials by path (e.g. `~/.config/agentry/secrets/
 foo.env`), which each person supplies themselves.
+
+To pull **one recipe by name** straight from a shared source — a git repo, a
+directory, or a `.recipe` URL — use `import`:
+
+```sh
+agentry recipes import email-agent colinrozzi/agentry     # from a GitHub repo
+agentry recipes import coding /mnt/shared/recipes          # from a shared folder
+```
+
+It looks for the recipe at the source root (`<source>/<name>/`) and under a
+`recipes/` subdir (`<source>/recipes/<name>/`), so both dedicated recipe repos
+and monorepos work. So a collection is just a repo, and installing one recipe
+from it is a one-liner — no cloning the whole thing.
 
 ### Session lifecycle
 
